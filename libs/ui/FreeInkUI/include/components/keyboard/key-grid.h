@@ -42,7 +42,7 @@ struct KeyGridProps {
   TextStyle labelText{};
   TextStyle secondaryText{};
   StyleSet keyStyles{};
-  int16_t gap = 0;
+  int16_t gap = 6;
   int16_t minTouchSize = 28;
   uint8_t radius = 0;
   bool inactiveSelection = false;
@@ -75,7 +75,7 @@ void keyGrid(Frame<MaxInteractions>& frame, Rect rect, const KeyGridProps& props
       bp.radius = props.radius;
       bp.enabled = key.enabled && key.kind != KeyKind::Disabled;
       if (key.kind == KeyKind::Delete && !bp.icon) {
-        bp.icon = lucideDeleteIcon16();
+        bp.icon = lucideDeleteIcon28();
         bp.label = nullptr;
       }
       // Space renders glyph art instead of a text label.

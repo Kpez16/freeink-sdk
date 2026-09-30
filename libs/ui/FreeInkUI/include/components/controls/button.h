@@ -31,6 +31,8 @@ struct ButtonProps {
   bool enabled = true;
   // Highlight insets affect paint only, preserving text and hit geometry.
   Insets highlightInsets{};
+  Insets padding{2, 4, 2, 4};
+  bool iconOnRight = false;
 };
 
 template <size_t MaxInteractions>
@@ -59,7 +61,8 @@ void button(Frame<MaxInteractions>& frame, Rect rect, const ButtonProps& props) 
                     props.borderEdges);
   }
 
-  Rect content = rect.inset(Insets{2, 4, 2, 4});
+  Rect content = rect.inset(props.padding);
+  if (content.empty()) return;
   BitmapRef icon = props.icon ? props.icon : resolveBitmap(frame.assets(), props.iconAsset);
   // iconSize > 0 scales the icon (nearest-neighbor Contain) instead of
   // drawing at its native pixel size.
@@ -70,10 +73,12 @@ void button(Frame<MaxInteractions>& frame, Rect rect, const ButtonProps& props) 
     Size labelSize = frame.target().measureText(props.text.font, props.label, props.text);
     int16_t totalW = static_cast<int16_t>(iconW + props.gap + labelSize.width);
     int16_t x = static_cast<int16_t>(content.x + (content.width - totalW) / 2);
-    Rect iconRect{x, static_cast<int16_t>(content.y + (content.height - iconH) / 2), iconW, iconH};
+    const int16_t iconX = props.iconOnRight ? static_cast<int16_t>(x + labelSize.width + props.gap) : x;
+    Rect iconRect{iconX, static_cast<int16_t>(content.y + (content.height - iconH) / 2), iconW, iconH};
     frame.target().bitmap(iconRect, icon, iconMode, style.foreground);
-    Rect textRect{static_cast<int16_t>(x + iconW + props.gap), content.y,
-                  static_cast<int16_t>(content.right() - x - iconW - props.gap), content.height};
+    const int16_t textX = props.iconOnRight ? x : static_cast<int16_t>(x + iconW + props.gap);
+    Rect textRect{textX, content.y, props.iconOnRight ? labelSize.width : static_cast<int16_t>(content.right() - textX),
+                  content.height};
     TextStyle textStyle = textStyleWithForeground(props.text, style.foreground);
     textStyle.align = TextAlign::Left;
     frame.target().text(textRect, props.label, textStyle);
