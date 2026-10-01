@@ -35,7 +35,11 @@ class GfxRendererTarget final : public DrawTarget {
   static constexpr FontId FONT_SMALL = 0;
   static constexpr FontId FONT_BODY = 1;
   static constexpr FontId FONT_TITLE = 2;
-  static constexpr size_t FONT_SLOTS = 3;
+  // Status/label chrome (header battery percent, clock). Follows FONT_SMALL
+  // unless bound explicitly, so apps whose FONT_SMALL scales with the UI can
+  // pin chrome to a fixed size without touching list subtitles.
+  static constexpr FontId FONT_LABEL = 3;
+  static constexpr size_t FONT_SLOTS = 4;
 
   explicit GfxRendererTarget(const GfxRenderer& renderer, const bool hasTouch = false)
       : renderer(renderer), hasTouch_(hasTouch) {
@@ -105,6 +109,28 @@ class GfxRendererTarget final : public DrawTarget {
     return static_cast<int16_t>(renderer.getLineHeight(gfxFont(font)));
   }
 
+  // Ink from glyph metrics: drawText puts the baseline `ascender` below the
+  // line top, and a glyph's ink starts `top` above the baseline.
+  // ponytail: ASCII only (status labels, clocks); other text keeps the line box.
+  Rect inkBounds(const FontId font, const char* text, const TextStyle style) const override {
+    const Rect lineBox = DrawTarget::inkBounds(font, text, style);
+    const int fontId = gfxFont(font);
+    const auto it = renderer.getFontMap().find(fontId);
+    if (!text || it == renderer.getFontMap().end()) return lineBox;
+    const int ascender = renderer.getFontAscenderSize(fontId);
+    int top = lineBox.height;
+    int bottom = 0;
+    for (const char* p = text; *p; ++p) {
+      if (static_cast<unsigned char>(*p) >= 0x80) return lineBox;
+      const auto glyph = it->second.getGlyph(static_cast<uint32_t>(*p), fontStyle(style));
+      if (!glyph || glyph->height <= 0) continue;
+      top = std::min(top, ascender - static_cast<int>(glyph->top));
+      bottom = std::max(bottom, ascender - static_cast<int>(glyph->top) + static_cast<int>(glyph->height));
+    }
+    if (top >= bottom) return lineBox;
+    return Rect{0, static_cast<int16_t>(top), lineBox.width, static_cast<int16_t>(bottom - top)};
+  }
+
   void fill(const Rect rect, const Paint paint, const uint8_t radius = 0,
             const uint8_t corners = CornersAll) override {
     if (rect.empty()) return;
@@ -139,6 +165,17 @@ class GfxRendererTarget final : public DrawTarget {
   void stroke(const Rect rect, const Paint paint, const uint8_t width, const uint8_t radius = 0,
               const uint8_t corners = CornersAll) override {
     if (rect.empty() || width == 0 || paint.kind == PaintKind::None) return;
+    if (paint.kind == PaintKind::Dither && radius == 0) {
+      // Square dithered border as four edge bands; drawRect() is 1-bit only.
+      const int inner = rect.height > 2 * width ? rect.height - 2 * width : 0;
+      renderer.fillRectDither(rect.x, rect.y, rect.width, width, gfxColor(paint.color));
+      renderer.fillRectDither(rect.x, rect.y + rect.height - width, rect.width, width, gfxColor(paint.color));
+      if (inner > 0) {
+        renderer.fillRectDither(rect.x, rect.y + width, width, inner, gfxColor(paint.color));
+        renderer.fillRectDither(rect.x + rect.width - width, rect.y + width, width, inner, gfxColor(paint.color));
+      }
+      return;
+    }
     const bool black = paint.color != Color::White;
     if (radius > 0) {
       if (corners == CornersAll) {
@@ -250,11 +287,18 @@ class GfxRendererTarget final : public DrawTarget {
           (epdStyle & (EpdFontFamily::SUP | EpdFontFamily::SUB)) == 0) {
         const auto& fonts = renderer.getFontMap();
         const auto font = fonts.find(fontId);
-        const auto* glyph = font != fonts.end() ? font->second.getGlyph(static_cast<uint32_t>(textLine[0]), epdStyle)
-                                               : nullptr;
-        if (glyph && glyph->width > 0 && glyph->height > 0 && glyph->width <= rect.width && glyph->height <= rect.height) {
-          x = rect.x + (rect.width - glyph->width) / 2 - glyph->left;
-          drawY = rect.y + (rect.height - glyph->height) / 2 + glyph->top - renderer.getFontAscenderSize(fontId);
+        // `auto` and a scoped if, rather than naming the type and comparing a ternary against
+        // nullptr, so this compiles whatever getGlyph() returns. Some consumers hand back a
+        // `const EpdGlyph*`; others a resolved value type, because a font may store its glyph
+        // records in more than one shape and no single pointer can then serve them all. Both
+        // spellings are testable for presence and read their metrics through `->`.
+        if (font != fonts.end()) {
+          const auto glyph = font->second.getGlyph(static_cast<uint32_t>(textLine[0]), epdStyle);
+          if (glyph && glyph->width > 0 && glyph->height > 0 && glyph->width <= rect.width &&
+              glyph->height <= rect.height) {
+            x = rect.x + (rect.width - glyph->width) / 2 - glyph->left;
+            drawY = rect.y + (rect.height - glyph->height) / 2 + glyph->top - renderer.getFontAscenderSize(fontId);
+          }
         }
       }
       if (dithered && tryDrawTextDither(renderer, fontId, x, drawY, textLine, gfxColor(inkColor), epdStyle, 0)) {
@@ -315,7 +359,11 @@ class GfxRendererTarget final : public DrawTarget {
   bool hasTouch_ = false;
   int fonts[FONT_SLOTS];
 
-  int gfxFont(const FontId slot) const { return slot < FONT_SLOTS ? fonts[slot] : fonts[FONT_BODY]; }
+  int gfxFont(const FontId slot) const {
+    // FONT_LABEL follows FONT_SMALL until an app binds it explicitly.
+    if (slot == FONT_LABEL && fonts[FONT_LABEL] == 0) return fonts[FONT_SMALL];
+    return slot < FONT_SLOTS ? fonts[slot] : fonts[FONT_BODY];
+  }
 
   // FreeInkUI colors map onto GfxRenderer's Bayer dither levels.
   static ::Color gfxColor(const Color color) {
@@ -351,6 +399,7 @@ class GfxRendererFrame {
     target.setFont(GfxRendererTarget::FONT_SMALL, smallFontId);
     target.setFont(GfxRendererTarget::FONT_BODY, bodyFontId);
     target.setFont(GfxRendererTarget::FONT_TITLE, titleFontId);
+    target.setFont(GfxRendererTarget::FONT_LABEL, smallFontId);
   }
 
   GfxRendererTarget target;

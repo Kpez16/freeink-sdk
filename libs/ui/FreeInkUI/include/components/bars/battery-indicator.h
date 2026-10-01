@@ -231,9 +231,13 @@ void batteryIndicator(Frame<MaxInteractions>& frame, Rect rect,
   if (props.label) {
     TextStyle style = props.text;
     style.align = TextAlign::Right;
-    Rect labelRect{rect.x, rect.y,
-                   static_cast<int16_t>(body.x - props.gap - rect.x),
-                   rect.height};
+    // Center the label's visible ink on the glyph: plain line-box centering
+    // leaves the digits hanging low by the font's internal leading.
+    const int16_t lh = frame.target().lineHeight(style.font);
+    const Rect ink = frame.target().inkBounds(style.font, props.label, style);
+    const int16_t labelY =
+        static_cast<int16_t>(body.y + (body.height - ink.height) / 2 - ink.y);
+    Rect labelRect{rect.x, labelY, static_cast<int16_t>(body.x - props.gap - rect.x), lh};
     drawText(frame.target(), labelRect, props.label, style);
   }
 }
