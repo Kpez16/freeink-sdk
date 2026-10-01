@@ -7,6 +7,9 @@
 #if ESP_IDF_VERSION_MAJOR < 5
 #include <esp_adc_cal.h>
 #endif
+#if defined(ENABLE_SERIAL_LOG)
+#include <esp_rom_sys.h>
+#endif
 
 #include <algorithm>
 #include <cmath>
@@ -245,7 +248,17 @@ bool readGaugeSoc(uint16_t& out) {
     return true;
   }
   uint16_t soc = 0;
-  if (!readReg16(g.gaugeAddr, BQ27220_STATE_OF_CHARGE, soc)) return false;
+  if (!readReg16(g.gaugeAddr, BQ27220_STATE_OF_CHARGE, soc)) {
+#if defined(ENABLE_SERIAL_LOG)
+    // Diagnostic only (card: battery stops reporting a charge around 35%). If
+    // this fires repeatedly while the charger-side log above keeps saying
+    // fast-charge, the on-screen percentage is frozen because the gauge
+    // stopped answering, not because the pack is actually done charging.
+    esp_rom_printf("[BATT] BQ27220 SoC read (addr 0x%02X reg 0x%02X) failed\n", g.gaugeAddr,
+                    BQ27220_STATE_OF_CHARGE);
+#endif
+    return false;
+  }
   out = soc > 100 ? 100 : soc;
   return true;
 }
@@ -328,8 +341,35 @@ bool readGaugeCharging(bool& known) {
     if (readReg8(g.chargerAddr, BQ25896_REG_STATUS, status)) {
       known = true;
       const uint8_t chrg = (status >> 3) & 0x03;
+      // Diagnostic only (card: battery stops reporting a charge around 35%).
+      // CHRG_STAT: 00 not charging, 01 pre-charge, 10 fast charge, 11 charge
+      // termination done. Throttled to once every 30s so a full charge cycle
+      // produces a short, readable trace in `pio device monitor` instead of a
+      // line per poll. This distinguishes "the BQ25896 itself ended the
+      // charge" (chrg == 0b11, a real charger-side termination to chase in the
+      // charger's own config/thermal/ITERM behavior) from "the gauge stopped
+      // answering" (readGaugeSoc() failing below, chrg still 0b10) -- those
+      // look identical on-screen but need different fixes.
+#if defined(ENABLE_SERIAL_LOG)
+      static unsigned long lastLogMs = 0;
+      static uint8_t lastChrg = 0xFF;
+      const unsigned long now = millis();
+      if (chrg != lastChrg || (now - lastLogMs) >= 30000) {
+        esp_rom_printf("[BATT] BQ25896 REG0B=0x%02X CHRG_STAT=%u (%s)\n", status, chrg,
+                        chrg == 0x00   ? "not-charging"
+                        : chrg == 0x01 ? "pre-charge"
+                        : chrg == 0x02 ? "fast-charge"
+                                       : "done/terminated");
+        lastLogMs = now;
+        lastChrg = chrg;
+      }
+#endif
       return chrg == 0x01 || chrg == 0x02;
     }
+#if defined(ENABLE_SERIAL_LOG)
+    esp_rom_printf("[BATT] BQ25896 status read (addr 0x%02X reg 0x%02X) failed\n", g.chargerAddr,
+                    BQ25896_REG_STATUS);
+#endif
   }
   uint16_t raw = 0;
   if (readReg16(g.gaugeAddr, BQ27220_CURRENT, raw)) {
