@@ -355,13 +355,50 @@ bool readGaugeCharging(bool& known) {
       static uint8_t lastChrg = 0xFF;
       const unsigned long now = millis();
       if (chrg != lastChrg || (now - lastLogMs) >= 30000) {
-        esp_rom_printf("[BATT] BQ25896 REG0B=0x%02X CHRG_STAT=%u (%s)\n", status, chrg,
+        // VBUS_STAT/PG_STAT bit positions per readChargerExternalPower()'s own
+        // comment above, read from the same register for one consistent decode.
+        const uint8_t vbus = (status >> 5) & 0x07;
+        const bool powerGood = (status & 0x04) != 0;
+        esp_rom_printf("[BATT] BQ25896 REG0B=0x%02X VBUS_STAT=%u PG=%u CHRG_STAT=%u (%s)\n", status, vbus,
+                        powerGood ? 1 : 0, chrg,
                         chrg == 0x00   ? "not-charging"
                         : chrg == 0x01 ? "pre-charge"
                         : chrg == 0x02 ? "fast-charge"
                                        : "done/terminated");
         lastLogMs = now;
         lastChrg = chrg;
+      }
+      // One-time dump of the registers that actually decide WHEN it terminates:
+      // input current limit, fast-charge current, termination current, and
+      // target (float) charge voltage. Firmware never writes any of these --
+      // this board runs entirely on whatever the BQ25896 powered up with -- so
+      // if chrg == 0b11 (done) at an SoC that doesn't look like a real full
+      // battery, these are the values to check against the battery's actual
+      // rating rather than guessing. Read once (config doesn't change at
+      // runtime here) rather than on the 30s throttle above.
+      static bool dumpedConfig = false;
+      if (!dumpedConfig) {
+        dumpedConfig = true;
+        uint8_t reg00 = 0, reg04 = 0, reg05 = 0, reg06 = 0;
+        const bool ok00 = readReg8(g.chargerAddr, 0x00, reg00);
+        const bool ok04 = readReg8(g.chargerAddr, 0x04, reg04);
+        const bool ok05 = readReg8(g.chargerAddr, 0x05, reg05);
+        const bool ok06 = readReg8(g.chargerAddr, 0x06, reg06);
+        if (ok00 && ok04 && ok05 && ok06) {
+          const bool hiz = (reg00 & 0x80) != 0;
+          const unsigned iinlimMa = 100u + (reg00 & 0x3F) * 50u;
+          const unsigned ichgMa = (reg04 & 0x7F) * 64u;
+          const unsigned itermMa = 64u + (reg05 & 0x0F) * 64u;
+          const unsigned iprechgMa = 64u + ((reg05 >> 4) & 0x0F) * 64u;
+          const unsigned vregMv = 3840u + ((reg06 >> 2) & 0x3F) * 16u;
+          esp_rom_printf(
+              "[BATT] BQ25896 config: REG00=0x%02X HIZ=%u IINLIM=%umA | REG04=0x%02X ICHG=%umA | "
+              "REG05=0x%02X IPRECHG=%umA ITERM=%umA | REG06=0x%02X VREG=%umV\n",
+              reg00, hiz ? 1 : 0, iinlimMa, reg04, ichgMa, reg05, iprechgMa, itermMa, reg06, vregMv);
+        } else {
+          esp_rom_printf("[BATT] BQ25896 config register read failed (REG00=%d REG04=%d REG05=%d REG06=%d)\n",
+                          ok00, ok04, ok05, ok06);
+        }
       }
 #endif
       return chrg == 0x01 || chrg == 0x02;
