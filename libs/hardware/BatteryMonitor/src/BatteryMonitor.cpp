@@ -515,29 +515,72 @@ bool bq27220EnsureProfile(uint8_t addr) {
 #endif
   if (!haveDevId) return false;
 
-  if (!bq27220Unseal(addr)) return false;
+// One-shot trace through the rest of this function: every failure exit logs
+// which stage it was, so a failure past the device-number check (the one
+// case the log above doesn't explain) is identified immediately instead of
+// needing another round of guess-a-patch-and-retest.
+#if defined(ENABLE_SERIAL_LOG)
+#define BQ27220_TRACE_FAIL(stage)                                       \
+  do {                                                                  \
+    esp_rom_printf("[BATT] BQ27220 provisioning stopped at: %s\n", stage); \
+  } while (0)
+#else
+#define BQ27220_TRACE_FAIL(stage) \
+  do {                            \
+  } while (0)
+#endif
+
+  if (!bq27220Unseal(addr)) {
+    BQ27220_TRACE_FAIL("unseal");
+    return false;
+  }
 
   uint16_t opStatus = 0;
-  if (!bq27220ReadReg16Retry(addr, BQ27220_CMD_OPERATION_STATUS, opStatus)) return false;
+  if (!bq27220ReadReg16Retry(addr, BQ27220_CMD_OPERATION_STATUS, opStatus)) {
+    BQ27220_TRACE_FAIL("read operation status");
+    return false;
+  }
   bool needsProvisioning =
       (opStatus & BQ27220_OPSTATUS_INITCOMP) == 0 || (opStatus & BQ27220_OPSTATUS_CFGUPDATE) != 0;
 
   uint16_t ctrlStatus = 0;
-  if (!bq27220ReadReg16Retry(addr, BQ27220_CMD_CONTROL, ctrlStatus)) return false;
+  if (!bq27220ReadReg16Retry(addr, BQ27220_CMD_CONTROL, ctrlStatus)) {
+    BQ27220_TRACE_FAIL("read control status");
+    return false;
+  }
   if ((ctrlStatus & BQ27220_CTRLSTATUS_BATT_ID_MASK) != 0) needsProvisioning = true;
 
   if (!needsProvisioning && !bq27220ApplyOrVerifyDataMemory(addr, /*write=*/false)) {
     needsProvisioning = true;
   }
 
+#if defined(ENABLE_SERIAL_LOG)
+  esp_rom_printf("[BATT] BQ27220 opStatus=0x%04X ctrlStatus=0x%04X needsProvisioning=%u\n", opStatus, ctrlStatus,
+                  needsProvisioning ? 1 : 0);
+#endif
+
   if (needsProvisioning) {
-    if (!bq27220Reset(addr)) return false;
-    if (!bq27220FullAccess(addr)) return false;
+    if (!bq27220Reset(addr)) {
+      BQ27220_TRACE_FAIL("reset");
+      return false;
+    }
+    if (!bq27220FullAccess(addr)) {
+      BQ27220_TRACE_FAIL("full access");
+      return false;
+    }
     bq27220ApplyOrVerifyDataMemory(addr, /*write=*/true);
-    if (!bq27220ApplyOrVerifyDataMemory(addr, /*write=*/false)) return false;
+    if (!bq27220ApplyOrVerifyDataMemory(addr, /*write=*/false)) {
+      BQ27220_TRACE_FAIL("data memory write/verify");
+      return false;
+    }
   }
 
-  return bq27220Seal(addr);
+  if (!bq27220Seal(addr)) {
+    BQ27220_TRACE_FAIL("seal");
+    return false;
+  }
+  return true;
+#undef BQ27220_TRACE_FAIL
 }
 
 // SoC (0..100) from the active gauge, dispatched by type. false on I2C failure.
