@@ -16,6 +16,8 @@
 
 #if FREEINK_BATTERY_I2C_GAUGE
 #include <Wire.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 #if FREEINK_DEVICE_WS397
 #include <Axp2101.h>
 #endif
@@ -47,8 +49,34 @@ void ensureWire() {
   g_wireReady = true;
 }
 
+// gaugeWire() is one shared TwoWire bus (gauge + charger, and on some boards
+// touch/RTC pins too), reached from at least two independent FreeRTOS tasks:
+// the render task (this file's own multi-step BQ27220 provisioning, which can
+// hold the bus for seconds) and the main loop task (HalGPIO::isUsbConnected()
+// falls back to BatteryMonitor::isCharging() on boards with no dedicated
+// usb-detect pin, e.g. LilyGo T5 S3, and main.cpp calls it every iteration).
+// TwoWire/the underlying i2c_master driver isn't safe for concurrent use from
+// two tasks -- same class of hazard as SdFat (see this project's storageMutex
+// in HalStorage) -- and without serializing here, two transactions landing at
+// once corrupt the driver's state machine (observed as sporadic
+// ESP_ERR_INVALID_STATE from esp32-hal-i2c-ng, most visible during the long
+// BQ27220 provisioning sequence below). Lazily created: C++11 guarantees a
+// function-local static's initialization is itself thread-safe.
+SemaphoreHandle_t i2cBusMutex() {
+  static SemaphoreHandle_t mutex = xSemaphoreCreateMutex();
+  return mutex;
+}
+
+struct I2cBusLock {
+  I2cBusLock() { xSemaphoreTake(i2cBusMutex(), portMAX_DELAY); }
+  ~I2cBusLock() { xSemaphoreGive(i2cBusMutex()); }
+  I2cBusLock(const I2cBusLock&) = delete;
+  I2cBusLock& operator=(const I2cBusLock&) = delete;
+};
+
 bool readReg16(uint8_t addr, uint8_t reg, uint16_t& out) {
   if (addr == 0) return false;
+  I2cBusLock lock;
   ensureWire();
   TwoWire& w = gaugeWire();
   w.beginTransmission(addr);
@@ -63,6 +91,7 @@ bool readReg16(uint8_t addr, uint8_t reg, uint16_t& out) {
 
 bool readReg8(uint8_t addr, uint8_t reg, uint8_t& out) {
   if (addr == 0) return false;
+  I2cBusLock lock;
   ensureWire();
   TwoWire& w = gaugeWire();
   w.beginTransmission(addr);
@@ -75,6 +104,7 @@ bool readReg8(uint8_t addr, uint8_t reg, uint8_t& out) {
 
 bool writeReg8(uint8_t addr, uint8_t reg, uint8_t val) {
   if (addr == 0) return false;
+  I2cBusLock lock;
   ensureWire();
   TwoWire& w = gaugeWire();
   w.beginTransmission(addr);
@@ -313,6 +343,7 @@ constexpr unsigned long BQ27220_I2C_RETRY_DELAY_MS = 10;
 
 bool bq27220WriteBytes(uint8_t addr, uint8_t reg, const uint8_t* data, uint8_t len) {
   if (addr == 0) return false;
+  I2cBusLock lock;
   ensureWire();
   for (uint8_t attempt = 0; attempt < BQ27220_I2C_RETRY_ATTEMPTS; ++attempt) {
     if (attempt > 0) delay(BQ27220_I2C_RETRY_DELAY_MS);
@@ -327,6 +358,7 @@ bool bq27220WriteBytes(uint8_t addr, uint8_t reg, const uint8_t* data, uint8_t l
 
 bool bq27220ReadBytes(uint8_t addr, uint8_t reg, uint8_t* dest, uint8_t len) {
   if (addr == 0) return false;
+  I2cBusLock lock;
   ensureWire();
   for (uint8_t attempt = 0; attempt < BQ27220_I2C_RETRY_ATTEMPTS; ++attempt) {
     if (attempt > 0) delay(BQ27220_I2C_RETRY_DELAY_MS);
