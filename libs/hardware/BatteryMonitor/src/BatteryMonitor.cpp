@@ -487,13 +487,32 @@ bool bq27220ReadReg16Retry(uint8_t addr, uint8_t reg, uint16_t& out, uint8_t att
 // Safe to call every boot: a gauge that already matches just gets a quick
 // read-only verify and a seal.
 bool bq27220EnsureProfile(uint8_t addr) {
+  // Let whatever transaction readGaugeCharging()/readGaugeMillivolts() just
+  // ran against this same bus (same gauge address, interleaved with the
+  // charger's own address) fully settle before this function's first I2C
+  // call. Testing showed the very first op here -- sometimes the write,
+  // sometimes the read right after it -- intermittently returns
+  // ESP_ERR_INVALID_STATE from the ESP32-S3 I2C driver; a short pause here
+  // costs nothing (this path only runs once per second at most) and is the
+  // standard mitigation for that class of driver issue.
+  delay(20);
+
   uint16_t devId = 0;
   bool haveDevId = false;
+  bool wroteSubCmd = false;
   for (uint8_t attempt = 0; attempt < 5 && !haveDevId; ++attempt) {
-    bq27220ControlSubCmd(addr, BQ27220_CONTROL_DEVICE_NUMBER);
+    if (attempt > 0) delay(20);
+    wroteSubCmd = bq27220ControlSubCmd(addr, BQ27220_CONTROL_DEVICE_NUMBER);
+    if (!wroteSubCmd) continue;
     delay(5);
     haveDevId = bq27220ReadU16(addr, BQ27220_CMD_MAC_DATA, devId) && devId == BQ27220_DEVICE_ID;
   }
+#if defined(ENABLE_SERIAL_LOG)
+  if (!haveDevId) {
+    esp_rom_printf("[BATT] BQ27220 device-number check failed: last subcmd write %s, devId=0x%04X\n",
+                    wroteSubCmd ? "ok" : "failed", devId);
+  }
+#endif
   if (!haveDevId) return false;
 
   if (!bq27220Unseal(addr)) return false;
