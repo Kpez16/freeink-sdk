@@ -417,26 +417,45 @@ constexpr Bq27220DmEntry BQ27220_DATA_MEMORY[] = {
     {0x9217, 2, 1},       // ConfigurationPowerSleepCurrent
 };
 
+// Retry budget shared by both primitives below. Testing on this board showed
+// ESP_ERR_INVALID_STATE from the ESP32-S3 Arduino core's I2C driver on
+// essentially any transaction in this provisioning sequence -- not tied to
+// one particular write or read -- at a low but real rate. Retrying here, at
+// the lowest level both bq27220ControlSubCmd and every status/data-memory
+// read/write funnel through, fixes it everywhere at once instead of needing
+// a retry loop hand-added at each call site (device-number, full-access,
+// seal, ... every one of them was hitting this independently).
+constexpr uint8_t BQ27220_I2C_RETRY_ATTEMPTS = 5;
+constexpr unsigned long BQ27220_I2C_RETRY_DELAY_MS = 10;
+
 bool bq27220WriteBytes(uint8_t addr, uint8_t reg, const uint8_t* data, uint8_t len) {
   if (addr == 0) return false;
   ensureWire();
-  TwoWire& w = gaugeWire();
-  w.beginTransmission(addr);
-  w.write(reg);
-  for (uint8_t i = 0; i < len; ++i) w.write(data[i]);
-  return w.endTransmission(true) == 0;
+  for (uint8_t attempt = 0; attempt < BQ27220_I2C_RETRY_ATTEMPTS; ++attempt) {
+    if (attempt > 0) delay(BQ27220_I2C_RETRY_DELAY_MS);
+    TwoWire& w = gaugeWire();
+    w.beginTransmission(addr);
+    w.write(reg);
+    for (uint8_t i = 0; i < len; ++i) w.write(data[i]);
+    if (w.endTransmission(true) == 0) return true;
+  }
+  return false;
 }
 
 bool bq27220ReadBytes(uint8_t addr, uint8_t reg, uint8_t* dest, uint8_t len) {
   if (addr == 0) return false;
   ensureWire();
-  TwoWire& w = gaugeWire();
-  w.beginTransmission(addr);
-  w.write(reg);
-  if (w.endTransmission(true) != 0) return false;
-  if (w.requestFrom(addr, len) < len) return false;
-  for (uint8_t i = 0; i < len; ++i) dest[i] = w.read();
-  return true;
+  for (uint8_t attempt = 0; attempt < BQ27220_I2C_RETRY_ATTEMPTS; ++attempt) {
+    if (attempt > 0) delay(BQ27220_I2C_RETRY_DELAY_MS);
+    TwoWire& w = gaugeWire();
+    w.beginTransmission(addr);
+    w.write(reg);
+    if (w.endTransmission(true) != 0) continue;
+    if (w.requestFrom(addr, len) < len) continue;
+    for (uint8_t i = 0; i < len; ++i) dest[i] = w.read();
+    return true;
+  }
+  return false;
 }
 
 bool bq27220ControlSubCmd(uint8_t addr, uint16_t subCmd) {
