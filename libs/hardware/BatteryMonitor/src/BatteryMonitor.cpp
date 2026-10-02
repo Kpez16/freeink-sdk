@@ -628,9 +628,17 @@ bool bq27220EnsureProfile(uint8_t addr) {
 #endif
 
   if (needsProvisioning) {
+    // Best-effort, not a gate: the vendor's own reference init() (LilyGo's
+    // lib/BQ27220, BQ27220::init()) calls reset() here and only logs on
+    // failure -- it does NOT bail out, and proceeds to fullAccess() and the
+    // data-memory write regardless. On this board reset()'s OperationStatus
+    // never shows the expected INITCOMP transition within its timeout (opStatus
+    // reads back identical for the full 4s), matching the vendor's own comment
+    // doubting whether even the following fullAccess() call is necessary. What
+    // actually provisions the gauge is fullAccess() + the data-memory write
+    // below, not this step completing.
     if (!bq27220Reset(addr)) {
-      BQ27220_TRACE_FAIL("reset");
-      return false;
+      BQ27220_TRACE_FAIL("reset (continuing anyway, as the vendor's own init() does)");
     }
     if (!bq27220FullAccess(addr)) {
       BQ27220_TRACE_FAIL("full access");
