@@ -359,12 +359,25 @@ bool readGaugeCharging(bool& known) {
         // comment above, read from the same register for one consistent decode.
         const uint8_t vbus = (status >> 5) & 0x07;
         const bool powerGood = (status & 0x04) != 0;
-        esp_rom_printf("[BATT] BQ25896 REG0B=0x%02X VBUS_STAT=%u PG=%u CHRG_STAT=%u (%s)\n", status, vbus,
-                        powerGood ? 1 : 0, chrg,
-                        chrg == 0x00   ? "not-charging"
-                        : chrg == 0x01 ? "pre-charge"
-                        : chrg == 0x02 ? "fast-charge"
-                                       : "done/terminated");
+        // Ground truth for the "35%, not a real full charge" question: the
+        // BQ27220 measures the BATTERY directly (not VBUS), on the same
+        // bus/cadence as the charger status above, so a voltage this close to
+        // REG06's VREG (see the one-time config dump below) at a low SoC
+        // means the pack genuinely reached that voltage early -- consistent
+        // with either a degraded/lower-capacity cell or excess series
+        // resistance, not a software misread of a healthy battery.
+        uint16_t vmv = 0;
+        uint16_t rawCur = 0;
+        const bool haveV = readReg16(g.gaugeAddr, BQ27220_VOLTAGE, vmv);
+        const bool haveI = readReg16(g.gaugeAddr, BQ27220_CURRENT, rawCur);
+        esp_rom_printf(
+            "[BATT] BQ25896 REG0B=0x%02X VBUS_STAT=%u PG=%u CHRG_STAT=%u (%s) | BQ27220 VBAT=%dmV I=%dmA\n",
+            status, vbus, powerGood ? 1 : 0, chrg,
+            chrg == 0x00   ? "not-charging"
+            : chrg == 0x01 ? "pre-charge"
+            : chrg == 0x02 ? "fast-charge"
+                           : "done/terminated",
+            haveV ? static_cast<int>(vmv) : -1, haveI ? static_cast<int>(static_cast<int16_t>(rawCur)) : -1);
         lastLogMs = now;
         lastChrg = chrg;
       }
