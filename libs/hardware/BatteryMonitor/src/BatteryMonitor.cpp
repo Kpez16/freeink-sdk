@@ -401,11 +401,18 @@ bool bq27220GetSec(uint8_t addr, uint8_t& sec) {
 }
 
 // Polls OperationStatus until `done` is satisfied or timeoutMs elapses.
-bool bq27220WaitForStatus(uint8_t addr, bool (*done)(uint16_t), unsigned long timeoutMs) {
+// `lastStatus`, when given, is left holding the most recent successfully-read
+// status even on timeout -- otherwise a timeout tells us nothing about
+// whether the chip was close to `done` or stuck in some other state.
+bool bq27220WaitForStatus(uint8_t addr, bool (*done)(uint16_t), unsigned long timeoutMs,
+                           uint16_t* lastStatus = nullptr) {
   const unsigned long deadline = millis() + timeoutMs;
   do {
     uint16_t status = 0;
-    if (bq27220ReadU16(addr, BQ27220_CMD_OPERATION_STATUS, status) && done(status)) return true;
+    if (bq27220ReadU16(addr, BQ27220_CMD_OPERATION_STATUS, status)) {
+      if (lastStatus) *lastStatus = status;
+      if (done(status)) return true;
+    }
     delay(1);
   } while (millis() < deadline);
   return false;
@@ -448,8 +455,18 @@ bool bq27220Seal(uint8_t addr) {
 
 bool bq27220Reset(uint8_t addr) {
   bq27220ControlSubCmd(addr, BQ27220_CONTROL_RESET);
-  return bq27220WaitForStatus(
-      addr, [](uint16_t status) { return (status & BQ27220_OPSTATUS_INITCOMP) != 0; }, 4000);
+  // 0xFFFF sentinel: distinguishes "timed out without ever reading status
+  // successfully" from "read status fine the whole time, it just never
+  // showed INITCOMP" -- the two point at very different problems.
+  uint16_t lastStatus = 0xFFFF;
+  const bool ok = bq27220WaitForStatus(
+      addr, [](uint16_t status) { return (status & BQ27220_OPSTATUS_INITCOMP) != 0; }, 4000, &lastStatus);
+#if defined(ENABLE_SERIAL_LOG)
+  if (!ok) {
+    esp_rom_printf("[BATT] BQ27220 reset timed out, last opStatus=0x%04X\n", lastStatus);
+  }
+#endif
+  return ok;
 }
 
 // Writes (or, with write=false, verifies) one data-memory entry. TI's data-
