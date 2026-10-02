@@ -326,6 +326,284 @@ bool cw2017EnsureProfile(const uint8_t addr) {
   return cw2017WaitUntilReady(addr);
 }
 
+// --- BQ27220 (TI) fuel gauge data-memory provisioning -----------------------
+// Diagnostics (serial log, same card) already confirmed: the BQ25896 charger
+// is correctly configured (its registers exactly match LilyGo's own factory
+// firmware values) and the gauge's raw voltage/current reads are accurate --
+// VBAT settled near the charger's real target with 0mA current, i.e. a
+// genuinely near-full pack -- while the gauge's own reported SoC sat around
+// 35%. The gauge computes SoC from a CEDV (Compensated End-of-Discharge
+// Voltage) model held in its non-volatile data memory, not from voltage
+// alone, and firmware never wrote that configuration -- it only ever read
+// BQ27220_VOLTAGE/CURRENT/STATE_OF_CHARGE above. That reconciles accurate
+// voltage with an inaccurate percentage.
+//
+// The table below is LilyGo's own BQ27220 data-memory profile (their
+// T5S3-4.7-e-paper-PRO repo, lib/BQ27220/bq27220_data_memory.c -- header
+// comment there labels it for their T-Embed-CC1101 board; no T5S3-specific
+// profile is published). FullChargeCapacity/DesignCapacity match this
+// board's 1500mAh cell exactly; the EMF/impedance/DOD-curve constants are
+// this chip family's reference values rather than ones characterized
+// against this exact cell. This only ever changes what percentage gets
+// reported: the gauge cannot influence charge voltage or current, which the
+// BQ25896 controls independently and already reads back correct, so a wrong
+// value here is a calibration gap, not a safety concern.
+constexpr uint8_t BQ27220_CMD_CONTROL = 0x00;
+constexpr uint8_t BQ27220_CMD_OPERATION_STATUS = 0x3A;
+constexpr uint8_t BQ27220_CMD_SELECT_SUBCLASS = 0x3E;
+constexpr uint8_t BQ27220_CMD_MAC_DATA = 0x40;
+constexpr uint8_t BQ27220_CMD_MAC_DATA_SUM = 0x60;
+
+constexpr uint16_t BQ27220_CONTROL_DEVICE_NUMBER = 0x0001;
+constexpr uint16_t BQ27220_CONTROL_SEALED = 0x0030;
+constexpr uint16_t BQ27220_CONTROL_RESET = 0x0041;
+constexpr uint16_t BQ27220_CONTROL_ENTER_CFG_UPDATE = 0x0090;
+constexpr uint16_t BQ27220_CONTROL_EXIT_CFG_UPDATE_REINIT = 0x0091;
+constexpr uint16_t BQ27220_CONTROL_UNSEAL_KEY1 = 0x0414;
+constexpr uint16_t BQ27220_CONTROL_UNSEAL_KEY2 = 0x3672;
+constexpr uint16_t BQ27220_CONTROL_FULL_ACCESS_KEY = 0xFFFF;
+constexpr uint16_t BQ27220_DEVICE_ID = 0x0220;
+
+// OperationStatus (read directly from CommandOperationStatus).
+constexpr uint16_t BQ27220_OPSTATUS_SEC_MASK = 0x0006;  // bits [2:1]
+constexpr uint8_t BQ27220_OPSTATUS_SEC_SHIFT = 1;
+constexpr uint8_t BQ27220_SEC_SEALED = 0b11;
+constexpr uint8_t BQ27220_SEC_UNSEALED = 0b10;
+constexpr uint8_t BQ27220_SEC_FULL = 0b01;
+constexpr uint16_t BQ27220_OPSTATUS_INITCOMP = 1u << 7;
+constexpr uint16_t BQ27220_OPSTATUS_CFGUPDATE = 1u << 10;
+// ControlStatus (read directly from CommandControl) BATT_ID is bits [2:0].
+constexpr uint16_t BQ27220_CTRLSTATUS_BATT_ID_MASK = 0x0007;
+
+struct Bq27220DmEntry {
+  uint16_t address;
+  uint8_t size;  // 1 or 2 bytes
+  uint32_t value;
+};
+
+// LilyGo's gauge_data_memory[] table, address-for-address and value-for-value.
+// GaugingConfig is inlined as its resolved 16-bit value (0x0D31: low byte 0x31
+// = CCT|SC|FIXED_EDV0, high byte 0x0D = FCC_LIM|FC_FOR_VDQ|IGNORE_SD) instead
+// of the pointer-to-bitfield the vendor driver reads it through, so one plain
+// table serves both the write and the read-back verify below.
+constexpr Bq27220DmEntry BQ27220_DATA_MEMORY[] = {
+    {0x9206, 2, 0x0C8C},  // OperationConfigA
+    {0x9208, 1, 0x4C},    // OperationConfigB
+    {0x929B, 2, 0x0D31},  // CEDV Profile 1 GaugingConfig
+    {0x929D, 2, 1500},    // FullChargeCapacity (mAh)
+    {0x929F, 2, 1500},    // DesignCapacity (mAh)
+    {0x92A3, 2, 3743},    // EMF
+    {0x92A9, 2, 149},     // C0
+    {0x92AB, 2, 867},     // R0
+    {0x92AD, 2, 4030},    // T0
+    {0x92AF, 2, 316},     // R1
+    {0x92B1, 1, 9},       // TC
+    {0x92B2, 1, 0},       // C1
+    {0x92BD, 2, 4173},    // StartDOD0
+    {0x92BF, 2, 4043},    // StartDOD10
+    {0x92C1, 2, 3925},    // StartDOD20
+    {0x92C3, 2, 3821},    // StartDOD30
+    {0x92C5, 2, 3725},    // StartDOD40
+    {0x92C7, 2, 3665},    // StartDOD50
+    {0x92C9, 2, 3619},    // StartDOD60
+    {0x92CB, 2, 3585},    // StartDOD70
+    {0x92CD, 2, 3515},    // StartDOD80
+    {0x92CF, 2, 3439},    // StartDOD90
+    {0x92D1, 2, 2713},    // StartDOD100
+    {0x92B4, 2, 3031},    // EDV0
+    {0x92B7, 2, 3385},    // EDV1
+    {0x92BA, 2, 3501},    // EDV2
+    {0x91DE, 1, 1},       // CalibrationCurrentDeadband
+    {0x9217, 2, 1},       // ConfigurationPowerSleepCurrent
+};
+
+bool bq27220WriteBytes(uint8_t addr, uint8_t reg, const uint8_t* data, uint8_t len) {
+  if (addr == 0) return false;
+  ensureWire();
+  TwoWire& w = gaugeWire();
+  w.beginTransmission(addr);
+  w.write(reg);
+  for (uint8_t i = 0; i < len; ++i) w.write(data[i]);
+  return w.endTransmission(true) == 0;
+}
+
+bool bq27220ReadBytes(uint8_t addr, uint8_t reg, uint8_t* dest, uint8_t len) {
+  if (addr == 0) return false;
+  ensureWire();
+  TwoWire& w = gaugeWire();
+  w.beginTransmission(addr);
+  w.write(reg);
+  if (w.endTransmission(true) != 0) return false;
+  if (w.requestFrom(addr, len) < len) return false;
+  for (uint8_t i = 0; i < len; ++i) dest[i] = w.read();
+  return true;
+}
+
+bool bq27220ControlSubCmd(uint8_t addr, uint16_t subCmd) {
+  const uint8_t buf[2] = {static_cast<uint8_t>(subCmd & 0xFF), static_cast<uint8_t>(subCmd >> 8)};
+  return bq27220WriteBytes(addr, BQ27220_CMD_CONTROL, buf, 2);
+}
+
+bool bq27220GetSec(uint8_t addr, uint8_t& sec) {
+  uint16_t status = 0;
+  if (!readReg16(addr, BQ27220_CMD_OPERATION_STATUS, status)) return false;
+  sec = static_cast<uint8_t>((status & BQ27220_OPSTATUS_SEC_MASK) >> BQ27220_OPSTATUS_SEC_SHIFT);
+  return true;
+}
+
+// Polls OperationStatus until `done` is satisfied or timeoutMs elapses.
+bool bq27220WaitForStatus(uint8_t addr, bool (*done)(uint16_t), unsigned long timeoutMs) {
+  const unsigned long deadline = millis() + timeoutMs;
+  do {
+    uint16_t status = 0;
+    if (readReg16(addr, BQ27220_CMD_OPERATION_STATUS, status) && done(status)) return true;
+    delay(1);
+  } while (millis() < deadline);
+  return false;
+}
+
+bool bq27220Unseal(uint8_t addr) {
+  uint8_t sec = 0;
+  if (!bq27220GetSec(addr, sec)) return false;
+  if (sec != BQ27220_SEC_SEALED) return true;
+  bq27220ControlSubCmd(addr, BQ27220_CONTROL_UNSEAL_KEY1);
+  delay(5);
+  bq27220ControlSubCmd(addr, BQ27220_CONTROL_UNSEAL_KEY2);
+  delay(5);
+  if (!bq27220GetSec(addr, sec)) return false;
+  return sec == BQ27220_SEC_UNSEALED;
+}
+
+bool bq27220FullAccess(uint8_t addr) {
+  uint8_t sec = 0;
+  if (!bq27220GetSec(addr, sec)) return false;
+  if (sec == BQ27220_SEC_FULL) return true;
+  if (sec != BQ27220_SEC_UNSEALED) return false;
+  bq27220ControlSubCmd(addr, BQ27220_CONTROL_FULL_ACCESS_KEY);
+  delay(5);
+  bq27220ControlSubCmd(addr, BQ27220_CONTROL_FULL_ACCESS_KEY);
+  delay(5);
+  if (!bq27220GetSec(addr, sec)) return false;
+  return sec == BQ27220_SEC_FULL;
+}
+
+bool bq27220Seal(uint8_t addr) {
+  uint8_t sec = 0;
+  if (!bq27220GetSec(addr, sec)) return false;
+  if (sec == BQ27220_SEC_SEALED) return true;
+  bq27220ControlSubCmd(addr, BQ27220_CONTROL_SEALED);
+  delay(1);
+  if (!bq27220GetSec(addr, sec)) return false;
+  return sec == BQ27220_SEC_SEALED;
+}
+
+bool bq27220Reset(uint8_t addr) {
+  bq27220ControlSubCmd(addr, BQ27220_CONTROL_RESET);
+  return bq27220WaitForStatus(
+      addr, [](uint16_t status) { return (status & BQ27220_OPSTATUS_INITCOMP) != 0; }, 4000);
+}
+
+// Writes (or, with write=false, verifies) one data-memory entry. TI's data-
+// flash words are big-endian; the command registers read elsewhere in this
+// file (BQ27220_VOLTAGE etc.) are little-endian -- different address spaces,
+// different byte order, both correct as written.
+bool bq27220DmParam(uint8_t addr, uint16_t dmAddr, uint32_t value, uint8_t size, bool write) {
+  uint8_t buffer[6] = {0};
+  buffer[0] = static_cast<uint8_t>(dmAddr & 0xFF);
+  buffer[1] = static_cast<uint8_t>((dmAddr >> 8) & 0xFF);
+  for (uint8_t i = 0; i < size; ++i) {
+    buffer[1 + size - i] = static_cast<uint8_t>((value >> (i * 8)) & 0xFF);
+  }
+
+  if (write) {
+    if (!bq27220WriteBytes(addr, BQ27220_CMD_SELECT_SUBCLASS, buffer, static_cast<uint8_t>(size + 2))) {
+      return false;
+    }
+    delay(1);
+    uint8_t checksum = 0;
+    for (uint8_t i = 0; i < size + 2; ++i) checksum += buffer[i];
+    checksum = static_cast<uint8_t>(0xFF - checksum);
+    buffer[0] = checksum;
+    buffer[1] = static_cast<uint8_t>(2 + size + 1 + 1);
+    if (!bq27220WriteBytes(addr, BQ27220_CMD_MAC_DATA_SUM, buffer, static_cast<uint8_t>(size + 2))) {
+      return false;
+    }
+    delay(10);
+    return true;
+  }
+
+  if (!bq27220WriteBytes(addr, BQ27220_CMD_SELECT_SUBCLASS, buffer, 2)) return false;
+  delay(1);
+  uint8_t readBack[4] = {0};
+  if (!bq27220ReadBytes(addr, BQ27220_CMD_MAC_DATA, readBack, size)) return false;
+  for (uint8_t i = 0; i < size; ++i) {
+    if (readBack[i] != buffer[2 + i]) return false;
+  }
+  return true;
+}
+
+// Applies (write=true) or verifies (write=false) the whole table in one
+// config-update session.
+bool bq27220ApplyOrVerifyDataMemory(uint8_t addr, bool write) {
+  if (write) {
+    bq27220ControlSubCmd(addr, BQ27220_CONTROL_ENTER_CFG_UPDATE);
+    if (!bq27220WaitForStatus(
+            addr, [](uint16_t s) { return (s & BQ27220_OPSTATUS_CFGUPDATE) != 0; }, 2000)) {
+      return false;
+    }
+  }
+
+  bool ok = true;
+  for (const auto& entry : BQ27220_DATA_MEMORY) {
+    if (!bq27220DmParam(addr, entry.address, entry.value, entry.size, write)) ok = false;
+  }
+
+  if (write && ok) {
+    bq27220ControlSubCmd(addr, BQ27220_CONTROL_EXIT_CFG_UPDATE_REINIT);
+    delay(2000);  // gauge needs this to re-learn against the new profile before answering again.
+    if (!bq27220WaitForStatus(
+            addr, [](uint16_t s) { return (s & BQ27220_OPSTATUS_CFGUPDATE) == 0; }, 2000)) {
+      return false;
+    }
+  }
+  return ok;
+}
+
+// Checks whether the gauge's resident data memory already matches
+// BQ27220_DATA_MEMORY and, only if it does not, unseals/resets/rewrites it.
+// Safe to call every boot: a gauge that already matches just gets a quick
+// read-only verify and a seal.
+bool bq27220EnsureProfile(uint8_t addr) {
+  bq27220ControlSubCmd(addr, BQ27220_CONTROL_DEVICE_NUMBER);
+  delay(1);
+  uint16_t devId = 0;
+  if (!readReg16(addr, BQ27220_CMD_MAC_DATA, devId) || devId != BQ27220_DEVICE_ID) return false;
+
+  if (!bq27220Unseal(addr)) return false;
+
+  uint16_t opStatus = 0;
+  if (!readReg16(addr, BQ27220_CMD_OPERATION_STATUS, opStatus)) return false;
+  bool needsProvisioning =
+      (opStatus & BQ27220_OPSTATUS_INITCOMP) == 0 || (opStatus & BQ27220_OPSTATUS_CFGUPDATE) != 0;
+
+  uint16_t ctrlStatus = 0;
+  if (!readReg16(addr, BQ27220_CMD_CONTROL, ctrlStatus)) return false;
+  if ((ctrlStatus & BQ27220_CTRLSTATUS_BATT_ID_MASK) != 0) needsProvisioning = true;
+
+  if (!needsProvisioning && !bq27220ApplyOrVerifyDataMemory(addr, /*write=*/false)) {
+    needsProvisioning = true;
+  }
+
+  if (needsProvisioning) {
+    if (!bq27220Reset(addr)) return false;
+    if (!bq27220FullAccess(addr)) return false;
+    bq27220ApplyOrVerifyDataMemory(addr, /*write=*/true);
+    if (!bq27220ApplyOrVerifyDataMemory(addr, /*write=*/false)) return false;
+  }
+
+  return bq27220Seal(addr);
+}
+
 // SoC (0..100) from the active gauge, dispatched by type. false on I2C failure.
 bool readGaugeSoc(uint16_t& out) {
   const auto& g = BoardConfig::ACTIVE.batteryGauge;
@@ -364,6 +642,25 @@ bool readGaugeSoc(uint16_t& out) {
     out = soc;
     return true;
   }
+  // One-time (per boot) data-memory provisioning: see bq27220EnsureProfile's
+  // own comment for why this fixes the reported-percentage-vs-real-voltage
+  // mismatch. Same bounded-retry shape as cw2017EnsureProfile above -- a
+  // transient I2C error on the very first call must not be cached as
+  // permanent failure.
+  static bool bq27220Initialized = false;
+  static unsigned long bq27220LastInitAttemptMs = 0;
+  if (!bq27220Initialized) {
+    const unsigned long now = millis();
+    if (bq27220LastInitAttemptMs != 0 && (now - bq27220LastInitAttemptMs) < 1000) return false;
+    bq27220LastInitAttemptMs = now;
+    bq27220Initialized = bq27220EnsureProfile(g.gaugeAddr);
+#if defined(ENABLE_SERIAL_LOG)
+    esp_rom_printf("[BATT] BQ27220 data-memory provisioning: %s\n",
+                    bq27220Initialized ? "ok (matches target profile)" : "failed, retrying");
+#endif
+    if (!bq27220Initialized) return false;
+  }
+
   uint16_t soc = 0;
   if (!readReg16(g.gaugeAddr, BQ27220_STATE_OF_CHARGE, soc)) {
 #if defined(ENABLE_SERIAL_LOG)
