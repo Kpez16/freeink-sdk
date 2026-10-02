@@ -327,9 +327,24 @@ bool bq27220ControlSubCmd(uint8_t addr, uint16_t subCmd) {
   return bq27220WriteBytes(addr, BQ27220_CMD_CONTROL, buf, 2);
 }
 
+// 16-bit read via bq27220ReadBytes's full-stop-then-new-start sequence, NOT
+// this file's readReg16 (repeated start, no stop). readReg16 is fine for the
+// plain command registers read elsewhere in this file (voltage/current/SoC),
+// but every status/control/MAC-area read here follows a subcommand write,
+// and the vendor driver this was ported from (LilyGo's lib/BQ27220) always
+// puts a full stop between that write and the read that follows it. Using
+// the repeated-start helper here instead was the actual cause of the
+// intermittent ESP_ERR_INVALID_STATE seen in testing -- not a bus fluke.
+bool bq27220ReadU16(uint8_t addr, uint8_t reg, uint16_t& out) {
+  uint8_t data[2] = {0, 0};
+  if (!bq27220ReadBytes(addr, reg, data, 2)) return false;
+  out = static_cast<uint16_t>(data[0]) | (static_cast<uint16_t>(data[1]) << 8);
+  return true;
+}
+
 bool bq27220GetSec(uint8_t addr, uint8_t& sec) {
   uint16_t status = 0;
-  if (!readReg16(addr, BQ27220_CMD_OPERATION_STATUS, status)) return false;
+  if (!bq27220ReadU16(addr, BQ27220_CMD_OPERATION_STATUS, status)) return false;
   sec = static_cast<uint8_t>((status & BQ27220_OPSTATUS_SEC_MASK) >> BQ27220_OPSTATUS_SEC_SHIFT);
   return true;
 }
@@ -339,7 +354,7 @@ bool bq27220WaitForStatus(uint8_t addr, bool (*done)(uint16_t), unsigned long ti
   const unsigned long deadline = millis() + timeoutMs;
   do {
     uint16_t status = 0;
-    if (readReg16(addr, BQ27220_CMD_OPERATION_STATUS, status) && done(status)) return true;
+    if (bq27220ReadU16(addr, BQ27220_CMD_OPERATION_STATUS, status) && done(status)) return true;
     delay(1);
   } while (millis() < deadline);
   return false;
@@ -461,7 +476,7 @@ bool bq27220ApplyOrVerifyDataMemory(uint8_t addr, bool write) {
 // second later) over one bus hiccup.
 bool bq27220ReadReg16Retry(uint8_t addr, uint8_t reg, uint16_t& out, uint8_t attempts = 5) {
   for (uint8_t i = 0; i < attempts; ++i) {
-    if (readReg16(addr, reg, out)) return true;
+    if (bq27220ReadU16(addr, reg, out)) return true;
     delay(5);
   }
   return false;
@@ -477,7 +492,7 @@ bool bq27220EnsureProfile(uint8_t addr) {
   for (uint8_t attempt = 0; attempt < 5 && !haveDevId; ++attempt) {
     bq27220ControlSubCmd(addr, BQ27220_CONTROL_DEVICE_NUMBER);
     delay(5);
-    haveDevId = readReg16(addr, BQ27220_CMD_MAC_DATA, devId) && devId == BQ27220_DEVICE_ID;
+    haveDevId = bq27220ReadU16(addr, BQ27220_CMD_MAC_DATA, devId) && devId == BQ27220_DEVICE_ID;
   }
   if (!haveDevId) return false;
 
