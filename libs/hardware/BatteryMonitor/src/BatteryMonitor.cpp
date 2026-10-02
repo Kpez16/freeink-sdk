@@ -560,6 +560,29 @@ bool bq27220FullAccess(uint8_t addr) {
   return sec == BQ27220_SEC_FULL;
 }
 
+// fullAccess()/seal() are each a quick, idempotent check-and-set: read the
+// security state, and if not already there, write one or two key subcommands
+// and read again. Every individual I2C transaction inside them already
+// retries at the primitive level (bq27220WriteBytes/ReadBytes), but that
+// doesn't help if the still-unresolved Arduino-ESP32 3.x "i2c-ng" driver bug
+// (ESP_ERR_INVALID_STATE from i2c_master's internal timing setup --
+// espressif/arduino-esp32#11374, not fixed by the latest available platform
+// release) is hit on every one of the ~5 retry attempts for a single
+// transaction -- rare per transaction, but with several transactions in one
+// stage it adds up. Retrying the whole stage costs nothing when it's already
+// satisfied (each returns true immediately on the first call) and
+// meaningfully compounds the odds of getting through it, instead of failing
+// the entire provisioning attempt over one bad moment and waiting for the
+// outer ~1s gate to retry everything from scratch.
+bool bq27220RetryStage(bool (*stage)(uint8_t), uint8_t addr, uint8_t attempts = 3,
+                        unsigned long delayMs = 50) {
+  for (uint8_t i = 0; i < attempts; ++i) {
+    if (i > 0) delay(delayMs);
+    if (stage(addr)) return true;
+  }
+  return false;
+}
+
 bool bq27220Seal(uint8_t addr) {
   uint8_t sec = 0;
   if (!bq27220GetSec(addr, sec)) return false;
@@ -757,7 +780,7 @@ bool bq27220EnsureProfile(uint8_t addr) {
     if (!bq27220Reset(addr)) {
       BQ27220_TRACE_FAIL("reset (continuing anyway, as the vendor's own init() does)");
     }
-    if (!bq27220FullAccess(addr)) {
+    if (!bq27220RetryStage(bq27220FullAccess, addr)) {
       BQ27220_TRACE_FAIL("full access");
       return false;
     }
@@ -768,7 +791,7 @@ bool bq27220EnsureProfile(uint8_t addr) {
     }
   }
 
-  if (!bq27220Seal(addr)) {
+  if (!bq27220RetryStage(bq27220Seal, addr)) {
     BQ27220_TRACE_FAIL("seal");
     return false;
   }
