@@ -452,25 +452,44 @@ bool bq27220ApplyOrVerifyDataMemory(uint8_t addr, bool write) {
   return ok;
 }
 
+// readReg16 with a few retries. The ESP32-S3's I2C driver can return a
+// transient ESP_ERR_INVALID_STATE from a non-stop write-read combined
+// transaction when it lands too soon after a preceding stop-terminated
+// write (seen in practice right after the DEVICE_NUMBER subcommand below) --
+// harmless and self-clearing, but worth absorbing here rather than failing
+// the whole provisioning attempt (and re-running the unseal/reset dance a
+// second later) over one bus hiccup.
+bool bq27220ReadReg16Retry(uint8_t addr, uint8_t reg, uint16_t& out, uint8_t attempts = 5) {
+  for (uint8_t i = 0; i < attempts; ++i) {
+    if (readReg16(addr, reg, out)) return true;
+    delay(5);
+  }
+  return false;
+}
+
 // Checks whether the gauge's resident data memory already matches
 // BQ27220_DATA_MEMORY and, only if it does not, unseals/resets/rewrites it.
 // Safe to call every boot: a gauge that already matches just gets a quick
 // read-only verify and a seal.
 bool bq27220EnsureProfile(uint8_t addr) {
-  bq27220ControlSubCmd(addr, BQ27220_CONTROL_DEVICE_NUMBER);
-  delay(1);
   uint16_t devId = 0;
-  if (!readReg16(addr, BQ27220_CMD_MAC_DATA, devId) || devId != BQ27220_DEVICE_ID) return false;
+  bool haveDevId = false;
+  for (uint8_t attempt = 0; attempt < 5 && !haveDevId; ++attempt) {
+    bq27220ControlSubCmd(addr, BQ27220_CONTROL_DEVICE_NUMBER);
+    delay(5);
+    haveDevId = readReg16(addr, BQ27220_CMD_MAC_DATA, devId) && devId == BQ27220_DEVICE_ID;
+  }
+  if (!haveDevId) return false;
 
   if (!bq27220Unseal(addr)) return false;
 
   uint16_t opStatus = 0;
-  if (!readReg16(addr, BQ27220_CMD_OPERATION_STATUS, opStatus)) return false;
+  if (!bq27220ReadReg16Retry(addr, BQ27220_CMD_OPERATION_STATUS, opStatus)) return false;
   bool needsProvisioning =
       (opStatus & BQ27220_OPSTATUS_INITCOMP) == 0 || (opStatus & BQ27220_OPSTATUS_CFGUPDATE) != 0;
 
   uint16_t ctrlStatus = 0;
-  if (!readReg16(addr, BQ27220_CMD_CONTROL, ctrlStatus)) return false;
+  if (!bq27220ReadReg16Retry(addr, BQ27220_CMD_CONTROL, ctrlStatus)) return false;
   if ((ctrlStatus & BQ27220_CTRLSTATUS_BATT_ID_MASK) != 0) needsProvisioning = true;
 
   if (!needsProvisioning && !bq27220ApplyOrVerifyDataMemory(addr, /*write=*/false)) {
