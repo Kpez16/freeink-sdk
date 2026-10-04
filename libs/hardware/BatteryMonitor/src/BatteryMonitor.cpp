@@ -799,6 +799,12 @@ bool bq27220EnsureProfile(uint8_t addr) {
 #undef BQ27220_TRACE_FAIL
 }
 
+// Whether this boot's BQ27220 data-memory provisioning has succeeded (see
+// readGaugeSoc() below, which is the only writer). File-scope so
+// BatteryMonitor::isGaugeProvisioned() can read it from outside this
+// function with no I2C traffic -- see that method's doc comment.
+static bool bq27220Initialized = false;
+
 // SoC (0..100) from the active gauge, dispatched by type. false on I2C failure.
 bool readGaugeSoc(uint16_t& out) {
   const auto& g = BoardConfig::ACTIVE.batteryGauge;
@@ -841,8 +847,9 @@ bool readGaugeSoc(uint16_t& out) {
   // own comment for why this fixes the reported-percentage-vs-real-voltage
   // mismatch. Same bounded-retry shape as cw2017EnsureProfile above -- a
   // transient I2C error on the very first call must not be cached as
-  // permanent failure.
-  static bool bq27220Initialized = false;
+  // permanent failure. File-scope (not function-local) so
+  // bq27220GaugeProvisioned() below can expose it to BatteryMonitor's
+  // isGaugeProvisioned() without any extra I2C traffic.
   static unsigned long bq27220LastInitAttemptMs = 0;
   if (!bq27220Initialized) {
     const unsigned long now = millis();
@@ -870,6 +877,12 @@ bool readGaugeSoc(uint16_t& out) {
   }
   out = soc > 100 ? 100 : soc;
   return true;
+}
+
+// Read-only, no-I2C accessor for BatteryMonitor::isGaugeProvisioned() --
+// see that method's doc comment for why main.cpp needs this.
+bool bq27220GaugeProvisioned() {
+  return bq27220Initialized;
 }
 
 // SoC in Q8 (percent << 8 | 1/256ths) from the active gauge. false on failure.
@@ -1326,6 +1339,21 @@ bool BatteryMonitor::isExternalPowerPresent(bool* known) const {
   }
   if (known) *known = false;
   return false;
+}
+
+bool BatteryMonitor::isGaugeProvisioned() const {
+#if FREEINK_BATTERY_I2C_GAUGE
+  const auto& g = BoardConfig::ACTIVE.batteryGauge;
+  // Only the BQ27220 path has a one-time provisioning step to track; CW2017
+  // (cw2017EnsureProfile) and AXP2101 need no equivalent wait, and boards
+  // with no I2C gauge at all have nothing to provision -- all report true
+  // so main.cpp's battery-poll gate does not force extra polling for them.
+  if (g.gaugeAddr != 0 && g.gaugeType != BoardConfig::GaugeType::Cw2017 &&
+      g.gaugeType != BoardConfig::GaugeType::Axp2101) {
+    return bq27220GaugeProvisioned();
+  }
+#endif
+  return true;
 }
 
 bool BatteryMonitor::readM5Pm1Status(Status& status) const {

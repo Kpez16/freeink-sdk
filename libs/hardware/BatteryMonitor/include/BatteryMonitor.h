@@ -100,6 +100,17 @@ public:
     // never had a way to see it.
     bool isExternalPowerPresent(bool* known = nullptr) const;
 
+    // True once this boot's one-time gauge data-memory provisioning (see
+    // readGaugeSoc()'s bq27220EnsureProfile call) has succeeded, or if this
+    // board's gauge needs no such step. No I2C -- reads an in-memory flag --
+    // so it is safe to call from a hot loop or before/instead of an I2C read.
+    // Lets a caller (main.cpp's battery-poll gate) keep retrying provisioning
+    // on a timer even while isExternalPowerPresent()/isCharging() reports no
+    // external power (e.g. once the charger reaches termination at 100%) --
+    // otherwise a provisioning attempt that fails once near boot never gets a
+    // second try for the rest of that boot.
+    bool isGaugeProvisioned() const;
+
     // Percentage from a millivolt value, off a standard 1S Li-ion discharge
     // curve. The result is always a multiple of 10: voltage cannot resolve a
     // Li-ion pack any finer than that, and pretending otherwise just produces a
