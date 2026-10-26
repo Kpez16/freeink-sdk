@@ -57,4 +57,12 @@ class LgfxEpdDriver : public PanelDriver {
 
 PanelDriver& lgfxEpdDriver();
 
+// Hand the LCD peripheral to another owner and take it back. Suspend waits for
+// the panel to go idle, powers the rails down and deletes the i80 bus; Resume
+// rebuilds it. After Resume the panel's picture is unknown, so the caller must
+// follow with a FULL_REFRESH. Both are no-ops returning false on builds without
+// the LovyanGFX driver.
+bool lgfxEpdSuspend();
+bool lgfxEpdResume();
+
 }  // namespace freeink
