@@ -4,18 +4,25 @@
 // every helper holds this lock for one complete transfer. Recursive: helpers may nest.
 //
 // The Metalio enables it (see metalio::ensureBooted()), and EEGO A4 enables it before its
-// touch controller boots in a background task; on every other board it does nothing until
-// it has been tested there.
-#if defined(ESP_PLATFORM) && (FREEINK_DEVICE_METALIO_EINK4 || FREEINK_DEVICE_EEGO_A4)
+// touch controller boots in a background task. The LilyGo T5 S3 starts with it enabled: its
+// GT911 touch, BQ27220 gauge and BQ25896 charger share SDA39/SCL40, the long BQ27220
+// provisioning sequence runs on the render task while the main loop polls charging, and
+// without the lock that produced sporadic ESP_ERR_INVALID_STATE. On every other board it
+// does nothing until it has been tested there.
+#if defined(ESP_PLATFORM) && (FREEINK_DEVICE_METALIO_EINK4 || FREEINK_DEVICE_EEGO_A4 || FREEINK_DEVICE_LILYGO)
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #endif
 
 namespace freeink {
 
-#if defined(ESP_PLATFORM) && (FREEINK_DEVICE_METALIO_EINK4 || FREEINK_DEVICE_EEGO_A4)
+#if defined(ESP_PLATFORM) && (FREEINK_DEVICE_METALIO_EINK4 || FREEINK_DEVICE_EEGO_A4 || FREEINK_DEVICE_LILYGO)
 inline bool& i2cBusLockEnabled() {
+#if FREEINK_DEVICE_LILYGO
+  static bool enabled = true;
+#else
   static bool enabled = false;
+#endif
   return enabled;
 }
 

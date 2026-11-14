@@ -7,6 +7,7 @@
 #if FREEINK_DRIVER_LGFX_EPD
 #include <M5GFX.h>  // pulls LovyanGFX; added to lib_deps only on the LilyGo env
 #include <esp_heap_caps.h>
+#include <esp_lcd_panel_io.h>
 #include <lgfx/v1/platforms/esp32/Bus_EPD.h>
 #include <lgfx/v1/platforms/esp32/Panel_EPD.hpp>
 #endif
@@ -32,6 +33,24 @@ class FreeInkBusEPD : public lgfx::Bus_EPD {
   bool init() override {
     if (g_hooks && g_hooks->prepare && !g_hooks->prepare()) return false;
     return lgfx::Bus_EPD::init();
+  }
+
+  // Give the LCD peripheral and its pins back to the system. LovyanGFX never
+  // does: Bus_EPD creates the i80 bus and panel-io in init() and has no inverse.
+  // A second owner of the peripheral (the emulator's FastEPD video path) needs
+  // both handles deleted first. init() above is a complete rebuild, so
+  // reclaiming the bus afterwards is just init() again.
+  void releaseBus() {
+    wait();
+    powerControl(false);
+    if (_io_handle) {
+      esp_lcd_panel_io_del(_io_handle);
+      _io_handle = nullptr;
+    }
+    if (_i80_bus_handle) {
+      esp_lcd_del_i80_bus(_i80_bus_handle);
+      _i80_bus_handle = nullptr;
+    }
   }
 
   bool powerControl(const bool powerOn) override {
@@ -100,6 +119,12 @@ class FreeInkLgfxEpd : public lgfx::LGFX_Device {
     setPanel(&_panel);
   }
 
+  void releaseBus() {
+    waitDisplay();
+    _bus.releaseBus();
+  }
+  bool reclaimBus() { return _bus.init(); }
+
  private:
   FreeInkBusEPD _bus;
   lgfx::Panel_EPD _panel;
@@ -140,6 +165,11 @@ lgfx::epd_mode::epd_mode_t epdModeFor(RefreshMode m) {
 
 // 8-bit gray canvas (PSRAM) the panel pushes from, plus the two 1-bpp planes the
 // facade streams for grayscale. Allocated once in begin().
+// True while lgfxEpdSuspend() has the LCD peripheral released. Every path that
+// would reach the bus returns early instead: a transfer on a deleted panel-io
+// handle fails and leaves Bus_EPD's busy flag set for good, and the next wait()
+// then spins until the task watchdog fires.
+bool g_suspended = false;
 lgfx::LGFX_Sprite* g_canvas = nullptr;
 uint8_t* g_lsb = nullptr;
 uint8_t* g_msb = nullptr;
@@ -223,6 +253,7 @@ lgfx::epd_mode::epd_mode_t g_lastBaseEpdMode = lgfx::epd_mode::epd_fast;
 bool lastPushUsedCleanBank() { return g_lastBaseEpdMode == lgfx::epd_mode::epd_text; }
 
 void pushCanvas(lgfx::epd_mode::epd_mode_t epdMode) {
+  if (g_suspended) return;
   if (!g_canvas) return;
   g_dev.waitDisplay();
   g_dev.setEpdMode(epdMode);
@@ -260,6 +291,7 @@ void pushCanvas(lgfx::epd_mode::epd_mode_t epdMode) {
 // Either way this writes the panel's own buffer and not the canvas, so the frame
 // the caller is about to push survives untouched.
 void normalizeForCleanBank() {
+  if (g_suspended) return;
   if (!g_cleanBankNeedsFreshBackground || !lastPushUsedCleanBank()) return;
   const auto bank = g_noDriveBankAvailable ? lgfx::epd_mode::epd_fastest : lgfx::epd_mode::epd_fast;
   g_dev.waitDisplay();
@@ -307,7 +339,7 @@ void LgfxEpdDriver::display(EpdBus& bus, const uint8_t* fb, const uint8_t* prev,
   if (epdMode == lgfx::epd_mode::epd_text) normalizeForCleanBank();
   g_lastBaseEpdMode = epdMode;
   pushCanvas(g_lastBaseEpdMode);
-  if (turnOff) g_dev.sleep();
+  if (turnOff) if (!g_suspended) g_dev.sleep();
 #else
   (void)fb;
   (void)mode;
@@ -363,7 +395,7 @@ void LgfxEpdDriver::displayGray(EpdBus& bus, const uint8_t* fb, bool turnOff, co
   // while display() maps HALF/FULL to epd_text, so a page refreshed with either
   // of those flashed when its AA pass ran.
   pushCanvas(g_lastBaseEpdMode);
-  if (turnOff) g_dev.sleep();
+  if (turnOff) if (!g_suspended) g_dev.sleep();
 #else
   (void)fb;
   (void)turnOff;
@@ -383,7 +415,29 @@ void LgfxEpdDriver::cleanupGrayscaleBuffers(EpdBus& bus, const uint8_t* bw) {
 void LgfxEpdDriver::deepSleep(EpdBus& bus) {
   (void)bus;
 #if FREEINK_DRIVER_LGFX_EPD
-  g_dev.sleep();
+  if (!g_suspended) g_dev.sleep();
+#endif
+}
+
+bool lgfxEpdSuspend() {
+#if FREEINK_DRIVER_LGFX_EPD
+  if (g_suspended) return true;
+  g_suspended = true;  // first: from here no new push may start
+  g_dev.releaseBus();
+  return true;
+#else
+  return false;
+#endif
+}
+
+bool lgfxEpdResume() {
+#if FREEINK_DRIVER_LGFX_EPD
+  if (!g_suspended) return true;
+  if (!g_dev.reclaimBus()) return false;
+  g_suspended = false;
+  return true;
+#else
+  return false;
 #endif
 }
 

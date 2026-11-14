@@ -13,6 +13,9 @@
 #if ESP_IDF_VERSION_MAJOR < 5
 #include <esp_adc_cal.h>
 #endif
+#if defined(ENABLE_SERIAL_LOG)
+#include <esp_rom_sys.h>
+#endif
 
 #include <algorithm>
 #include <cmath>
@@ -455,6 +458,455 @@ bool gaugeActive() {
   return cw2015State.present;
 }
 
+// --- BQ27220 (TI) fuel gauge data-memory provisioning -----------------------
+// Diagnostics (serial log, same card) already confirmed: the BQ25896 charger
+// is correctly configured (its registers exactly match LilyGo's own factory
+// firmware values) and the gauge's raw voltage/current reads are accurate --
+// VBAT settled near the charger's real target with 0mA current, i.e. a
+// genuinely near-full pack -- while the gauge's own reported SoC sat around
+// 35%. The gauge computes SoC from a CEDV (Compensated End-of-Discharge
+// Voltage) model held in its non-volatile data memory, not from voltage
+// alone, and firmware never wrote that configuration -- it only ever read
+// BQ27220_VOLTAGE/CURRENT/STATE_OF_CHARGE above. That reconciles accurate
+// voltage with an inaccurate percentage.
+//
+// The table below is LilyGo's own BQ27220 data-memory profile (their
+// T5S3-4.7-e-paper-PRO repo, lib/BQ27220/bq27220_data_memory.c -- header
+// comment there labels it for their T-Embed-CC1101 board; no T5S3-specific
+// profile is published). FullChargeCapacity/DesignCapacity match this
+// board's 1500mAh cell exactly; the EMF/impedance/DOD-curve constants are
+// this chip family's reference values rather than ones characterized
+// against this exact cell. This only ever changes what percentage gets
+// reported: the gauge cannot influence charge voltage or current, which the
+// BQ25896 controls independently and already reads back correct, so a wrong
+// value here is a calibration gap, not a safety concern.
+constexpr uint8_t BQ27220_CMD_CONTROL = 0x00;
+constexpr uint8_t BQ27220_CMD_OPERATION_STATUS = 0x3A;
+constexpr uint8_t BQ27220_CMD_SELECT_SUBCLASS = 0x3E;
+constexpr uint8_t BQ27220_CMD_MAC_DATA = 0x40;
+constexpr uint8_t BQ27220_CMD_MAC_DATA_SUM = 0x60;
+
+constexpr uint16_t BQ27220_CONTROL_DEVICE_NUMBER = 0x0001;
+constexpr uint16_t BQ27220_CONTROL_SEALED = 0x0030;
+constexpr uint16_t BQ27220_CONTROL_RESET = 0x0041;
+constexpr uint16_t BQ27220_CONTROL_ENTER_CFG_UPDATE = 0x0090;
+constexpr uint16_t BQ27220_CONTROL_EXIT_CFG_UPDATE_REINIT = 0x0091;
+constexpr uint16_t BQ27220_CONTROL_UNSEAL_KEY1 = 0x0414;
+constexpr uint16_t BQ27220_CONTROL_UNSEAL_KEY2 = 0x3672;
+constexpr uint16_t BQ27220_CONTROL_FULL_ACCESS_KEY = 0xFFFF;
+constexpr uint16_t BQ27220_DEVICE_ID = 0x0220;
+
+// OperationStatus (read directly from CommandOperationStatus).
+constexpr uint16_t BQ27220_OPSTATUS_SEC_MASK = 0x0006;  // bits [2:1]
+constexpr uint8_t BQ27220_OPSTATUS_SEC_SHIFT = 1;
+constexpr uint8_t BQ27220_SEC_SEALED = 0b11;
+constexpr uint8_t BQ27220_SEC_UNSEALED = 0b10;
+constexpr uint8_t BQ27220_SEC_FULL = 0b01;
+constexpr uint16_t BQ27220_OPSTATUS_INITCOMP = 1u << 7;
+constexpr uint16_t BQ27220_OPSTATUS_CFGUPDATE = 1u << 10;
+// ControlStatus (read directly from CommandControl) BATT_ID is bits [2:0].
+constexpr uint16_t BQ27220_CTRLSTATUS_BATT_ID_MASK = 0x0007;
+
+struct Bq27220DmEntry {
+  uint16_t address;
+  uint8_t size;  // 1 or 2 bytes
+  uint32_t value;
+};
+
+// LilyGo's gauge_data_memory[] table, address-for-address and value-for-value.
+// GaugingConfig is inlined as its resolved 16-bit value (0x0D31: low byte 0x31
+// = CCT|SC|FIXED_EDV0, high byte 0x0D = FCC_LIM|FC_FOR_VDQ|IGNORE_SD) instead
+// of the pointer-to-bitfield the vendor driver reads it through, so one plain
+// table serves both the write and the read-back verify below.
+constexpr Bq27220DmEntry BQ27220_DATA_MEMORY[] = {
+    {0x9206, 2, 0x0C8C},  // OperationConfigA
+    {0x9208, 1, 0x4C},    // OperationConfigB
+    {0x929B, 2, 0x0D31},  // CEDV Profile 1 GaugingConfig
+    {0x929D, 2, 1500},    // FullChargeCapacity (mAh)
+    {0x929F, 2, 1500},    // DesignCapacity (mAh)
+    {0x92A3, 2, 3743},    // EMF
+    {0x92A9, 2, 149},     // C0
+    {0x92AB, 2, 867},     // R0
+    {0x92AD, 2, 4030},    // T0
+    {0x92AF, 2, 316},     // R1
+    {0x92B1, 1, 9},       // TC
+    {0x92B2, 1, 0},       // C1
+    {0x92BD, 2, 4173},    // StartDOD0
+    {0x92BF, 2, 4043},    // StartDOD10
+    {0x92C1, 2, 3925},    // StartDOD20
+    {0x92C3, 2, 3821},    // StartDOD30
+    {0x92C5, 2, 3725},    // StartDOD40
+    {0x92C7, 2, 3665},    // StartDOD50
+    {0x92C9, 2, 3619},    // StartDOD60
+    {0x92CB, 2, 3585},    // StartDOD70
+    {0x92CD, 2, 3515},    // StartDOD80
+    {0x92CF, 2, 3439},    // StartDOD90
+    {0x92D1, 2, 2713},    // StartDOD100
+    {0x92B4, 2, 3031},    // EDV0
+    {0x92B7, 2, 3385},    // EDV1
+    {0x92BA, 2, 3501},    // EDV2
+    {0x91DE, 1, 1},       // CalibrationCurrentDeadband
+    {0x9217, 2, 1},       // ConfigurationPowerSleepCurrent
+};
+
+// Retry budget shared by both primitives below. Testing on this board showed
+// ESP_ERR_INVALID_STATE from the ESP32-S3 Arduino core's I2C driver on
+// essentially any transaction in this provisioning sequence -- not tied to
+// one particular write or read -- at a low but real rate. Retrying here, at
+// the lowest level both bq27220ControlSubCmd and every status/data-memory
+// read/write funnel through, fixes it everywhere at once instead of needing
+// a retry loop hand-added at each call site (device-number, full-access,
+// seal, ... every one of them was hitting this independently).
+constexpr uint8_t BQ27220_I2C_RETRY_ATTEMPTS = 5;
+constexpr unsigned long BQ27220_I2C_RETRY_DELAY_MS = 10;
+
+bool bq27220WriteBytes(uint8_t addr, uint8_t reg, const uint8_t* data, uint8_t len) {
+  if (addr == 0) return false;
+  const freeink::I2cBusLock busLock;
+  ensureWire();
+  for (uint8_t attempt = 0; attempt < BQ27220_I2C_RETRY_ATTEMPTS; ++attempt) {
+    if (attempt > 0) delay(BQ27220_I2C_RETRY_DELAY_MS);
+    TwoWire& w = gaugeWire();
+    w.beginTransmission(addr);
+    w.write(reg);
+    for (uint8_t i = 0; i < len; ++i) w.write(data[i]);
+    if (w.endTransmission(true) == 0) return true;
+  }
+  return false;
+}
+
+bool bq27220ReadBytes(uint8_t addr, uint8_t reg, uint8_t* dest, uint8_t len) {
+  if (addr == 0) return false;
+  const freeink::I2cBusLock busLock;
+  ensureWire();
+  for (uint8_t attempt = 0; attempt < BQ27220_I2C_RETRY_ATTEMPTS; ++attempt) {
+    if (attempt > 0) delay(BQ27220_I2C_RETRY_DELAY_MS);
+    TwoWire& w = gaugeWire();
+    w.beginTransmission(addr);
+    w.write(reg);
+    if (w.endTransmission(true) != 0) continue;
+    if (w.requestFrom(addr, len) < len) continue;
+    for (uint8_t i = 0; i < len; ++i) dest[i] = w.read();
+    return true;
+  }
+  return false;
+}
+
+bool bq27220ControlSubCmd(uint8_t addr, uint16_t subCmd) {
+  const uint8_t buf[2] = {static_cast<uint8_t>(subCmd & 0xFF), static_cast<uint8_t>(subCmd >> 8)};
+  return bq27220WriteBytes(addr, BQ27220_CMD_CONTROL, buf, 2);
+}
+
+// 16-bit read via bq27220ReadBytes's full-stop-then-new-start sequence, NOT
+// this file's readReg16 (repeated start, no stop). readReg16 is fine for the
+// plain command registers read elsewhere in this file (voltage/current/SoC),
+// but every status/control/MAC-area read here follows a subcommand write,
+// and the vendor driver this was ported from (LilyGo's lib/BQ27220) always
+// puts a full stop between that write and the read that follows it. Using
+// the repeated-start helper here instead was the actual cause of the
+// intermittent ESP_ERR_INVALID_STATE seen in testing -- not a bus fluke.
+bool bq27220ReadU16(uint8_t addr, uint8_t reg, uint16_t& out) {
+  uint8_t data[2] = {0, 0};
+  if (!bq27220ReadBytes(addr, reg, data, 2)) return false;
+  out = static_cast<uint16_t>(data[0]) | (static_cast<uint16_t>(data[1]) << 8);
+  return true;
+}
+
+bool bq27220GetSec(uint8_t addr, uint8_t& sec) {
+  uint16_t status = 0;
+  if (!bq27220ReadU16(addr, BQ27220_CMD_OPERATION_STATUS, status)) return false;
+  sec = static_cast<uint8_t>((status & BQ27220_OPSTATUS_SEC_MASK) >> BQ27220_OPSTATUS_SEC_SHIFT);
+  return true;
+}
+
+// Polls OperationStatus until `done` is satisfied or timeoutMs elapses.
+// `lastStatus`, when given, is left holding the most recent successfully-read
+// status even on timeout -- otherwise a timeout tells us nothing about
+// whether the chip was close to `done` or stuck in some other state.
+bool bq27220WaitForStatus(uint8_t addr, bool (*done)(uint16_t), unsigned long timeoutMs,
+                           uint16_t* lastStatus = nullptr) {
+  const unsigned long deadline = millis() + timeoutMs;
+  do {
+    uint16_t status = 0;
+    if (bq27220ReadU16(addr, BQ27220_CMD_OPERATION_STATUS, status)) {
+      if (lastStatus) *lastStatus = status;
+      if (done(status)) return true;
+    }
+    delay(1);
+  } while (millis() < deadline);
+  return false;
+}
+
+bool bq27220Unseal(uint8_t addr) {
+  uint8_t sec = 0;
+  if (!bq27220GetSec(addr, sec)) return false;
+  if (sec != BQ27220_SEC_SEALED) return true;
+  bq27220ControlSubCmd(addr, BQ27220_CONTROL_UNSEAL_KEY1);
+  delay(5);
+  bq27220ControlSubCmd(addr, BQ27220_CONTROL_UNSEAL_KEY2);
+  delay(5);
+  if (!bq27220GetSec(addr, sec)) return false;
+  return sec == BQ27220_SEC_UNSEALED;
+}
+
+bool bq27220FullAccess(uint8_t addr) {
+  uint8_t sec = 0;
+  if (!bq27220GetSec(addr, sec)) return false;
+  if (sec == BQ27220_SEC_FULL) return true;
+  if (sec != BQ27220_SEC_UNSEALED) return false;
+  bq27220ControlSubCmd(addr, BQ27220_CONTROL_FULL_ACCESS_KEY);
+  delay(5);
+  bq27220ControlSubCmd(addr, BQ27220_CONTROL_FULL_ACCESS_KEY);
+  delay(5);
+  if (!bq27220GetSec(addr, sec)) return false;
+  return sec == BQ27220_SEC_FULL;
+}
+
+// fullAccess()/seal() are each a quick, idempotent check-and-set: read the
+// security state, and if not already there, write one or two key subcommands
+// and read again. Every individual I2C transaction inside them already
+// retries at the primitive level (bq27220WriteBytes/ReadBytes), but that
+// doesn't help if the still-unresolved Arduino-ESP32 3.x "i2c-ng" driver bug
+// (ESP_ERR_INVALID_STATE from i2c_master's internal timing setup --
+// espressif/arduino-esp32#11374, not fixed by the latest available platform
+// release) is hit on every one of the ~5 retry attempts for a single
+// transaction -- rare per transaction, but with several transactions in one
+// stage it adds up. Retrying the whole stage costs nothing when it's already
+// satisfied (each returns true immediately on the first call) and
+// meaningfully compounds the odds of getting through it, instead of failing
+// the entire provisioning attempt over one bad moment and waiting for the
+// outer ~1s gate to retry everything from scratch.
+bool bq27220RetryStage(bool (*stage)(uint8_t), uint8_t addr, uint8_t attempts = 3,
+                        unsigned long delayMs = 50) {
+  for (uint8_t i = 0; i < attempts; ++i) {
+    if (i > 0) delay(delayMs);
+    if (stage(addr)) return true;
+  }
+  return false;
+}
+
+bool bq27220Seal(uint8_t addr) {
+  uint8_t sec = 0;
+  if (!bq27220GetSec(addr, sec)) return false;
+  if (sec == BQ27220_SEC_SEALED) return true;
+  bq27220ControlSubCmd(addr, BQ27220_CONTROL_SEALED);
+  delay(1);
+  if (!bq27220GetSec(addr, sec)) return false;
+  return sec == BQ27220_SEC_SEALED;
+}
+
+bool bq27220Reset(uint8_t addr) {
+  bq27220ControlSubCmd(addr, BQ27220_CONTROL_RESET);
+  // 0xFFFF sentinel: distinguishes "timed out without ever reading status
+  // successfully" from "read status fine the whole time, it just never
+  // showed INITCOMP" -- the two point at very different problems.
+  uint16_t lastStatus = 0xFFFF;
+  const bool ok = bq27220WaitForStatus(
+      addr, [](uint16_t status) { return (status & BQ27220_OPSTATUS_INITCOMP) != 0; }, 4000, &lastStatus);
+#if defined(ENABLE_SERIAL_LOG)
+  if (!ok) {
+    esp_rom_printf("[BATT] BQ27220 reset timed out, last opStatus=0x%04X\n", lastStatus);
+  }
+#endif
+  return ok;
+}
+
+// Writes (or, with write=false, verifies) one data-memory entry. TI's data-
+// flash words are big-endian; the command registers read elsewhere in this
+// file (BQ27220_VOLTAGE etc.) are little-endian -- different address spaces,
+// different byte order, both correct as written.
+bool bq27220DmParam(uint8_t addr, uint16_t dmAddr, uint32_t value, uint8_t size, bool write) {
+  uint8_t buffer[6] = {0};
+  buffer[0] = static_cast<uint8_t>(dmAddr & 0xFF);
+  buffer[1] = static_cast<uint8_t>((dmAddr >> 8) & 0xFF);
+  for (uint8_t i = 0; i < size; ++i) {
+    buffer[1 + size - i] = static_cast<uint8_t>((value >> (i * 8)) & 0xFF);
+  }
+
+  if (write) {
+    if (!bq27220WriteBytes(addr, BQ27220_CMD_SELECT_SUBCLASS, buffer, static_cast<uint8_t>(size + 2))) {
+      return false;
+    }
+    delay(1);
+    uint8_t checksum = 0;
+    for (uint8_t i = 0; i < size + 2; ++i) checksum += buffer[i];
+    checksum = static_cast<uint8_t>(0xFF - checksum);
+    buffer[0] = checksum;
+    buffer[1] = static_cast<uint8_t>(2 + size + 1 + 1);
+    if (!bq27220WriteBytes(addr, BQ27220_CMD_MAC_DATA_SUM, buffer, static_cast<uint8_t>(size + 2))) {
+      return false;
+    }
+    delay(10);
+    return true;
+  }
+
+  if (!bq27220WriteBytes(addr, BQ27220_CMD_SELECT_SUBCLASS, buffer, 2)) return false;
+  delay(1);
+  uint8_t readBack[4] = {0};
+  if (!bq27220ReadBytes(addr, BQ27220_CMD_MAC_DATA, readBack, size)) return false;
+  for (uint8_t i = 0; i < size; ++i) {
+    if (readBack[i] != buffer[2 + i]) return false;
+  }
+  return true;
+}
+
+// Applies (write=true) or verifies (write=false) the whole table in one
+// config-update session.
+bool bq27220ApplyOrVerifyDataMemory(uint8_t addr, bool write) {
+  if (write) {
+    bq27220ControlSubCmd(addr, BQ27220_CONTROL_ENTER_CFG_UPDATE);
+    if (!bq27220WaitForStatus(
+            addr, [](uint16_t s) { return (s & BQ27220_OPSTATUS_CFGUPDATE) != 0; }, 2000)) {
+      return false;
+    }
+  }
+
+  bool ok = true;
+  for (const auto& entry : BQ27220_DATA_MEMORY) {
+    if (!bq27220DmParam(addr, entry.address, entry.value, entry.size, write)) ok = false;
+  }
+
+  if (write && ok) {
+    bq27220ControlSubCmd(addr, BQ27220_CONTROL_EXIT_CFG_UPDATE_REINIT);
+    delay(2000);  // gauge needs this to re-learn against the new profile before answering again.
+    if (!bq27220WaitForStatus(
+            addr, [](uint16_t s) { return (s & BQ27220_OPSTATUS_CFGUPDATE) == 0; }, 2000)) {
+      return false;
+    }
+  }
+  return ok;
+}
+
+// readReg16 with a few retries. The ESP32-S3's I2C driver can return a
+// transient ESP_ERR_INVALID_STATE from a non-stop write-read combined
+// transaction when it lands too soon after a preceding stop-terminated
+// write (seen in practice right after the DEVICE_NUMBER subcommand below) --
+// harmless and self-clearing, but worth absorbing here rather than failing
+// the whole provisioning attempt (and re-running the unseal/reset dance a
+// second later) over one bus hiccup.
+bool bq27220ReadReg16Retry(uint8_t addr, uint8_t reg, uint16_t& out, uint8_t attempts = 5) {
+  for (uint8_t i = 0; i < attempts; ++i) {
+    if (bq27220ReadU16(addr, reg, out)) return true;
+    delay(5);
+  }
+  return false;
+}
+
+// Checks whether the gauge's resident data memory already matches
+// BQ27220_DATA_MEMORY and, only if it does not, unseals/resets/rewrites it.
+// Safe to call every boot: a gauge that already matches just gets a quick
+// read-only verify and a seal.
+bool bq27220EnsureProfile(uint8_t addr) {
+  // Let whatever transaction readGaugeCharging()/readGaugeMillivolts() just
+  // ran against this same bus (same gauge address, interleaved with the
+  // charger's own address) fully settle before this function's first I2C
+  // call. Testing showed the very first op here -- sometimes the write,
+  // sometimes the read right after it -- intermittently returns
+  // ESP_ERR_INVALID_STATE from the ESP32-S3 I2C driver; a short pause here
+  // costs nothing (this path only runs once per second at most) and is the
+  // standard mitigation for that class of driver issue.
+  delay(20);
+
+  uint16_t devId = 0;
+  bool haveDevId = false;
+  bool wroteSubCmd = false;
+  for (uint8_t attempt = 0; attempt < 5 && !haveDevId; ++attempt) {
+    if (attempt > 0) delay(20);
+    wroteSubCmd = bq27220ControlSubCmd(addr, BQ27220_CONTROL_DEVICE_NUMBER);
+    if (!wroteSubCmd) continue;
+    delay(5);
+    haveDevId = bq27220ReadU16(addr, BQ27220_CMD_MAC_DATA, devId) && devId == BQ27220_DEVICE_ID;
+  }
+#if defined(ENABLE_SERIAL_LOG)
+  if (!haveDevId) {
+    esp_rom_printf("[BATT] BQ27220 device-number check failed: last subcmd write %s, devId=0x%04X\n",
+                    wroteSubCmd ? "ok" : "failed", devId);
+  }
+#endif
+  if (!haveDevId) return false;
+
+// One-shot trace through the rest of this function: every failure exit logs
+// which stage it was, so a failure past the device-number check (the one
+// case the log above doesn't explain) is identified immediately instead of
+// needing another round of guess-a-patch-and-retest.
+#if defined(ENABLE_SERIAL_LOG)
+#define BQ27220_TRACE_FAIL(stage)                                       \
+  do {                                                                  \
+    esp_rom_printf("[BATT] BQ27220 provisioning stopped at: %s\n", stage); \
+  } while (0)
+#else
+#define BQ27220_TRACE_FAIL(stage) \
+  do {                            \
+  } while (0)
+#endif
+
+  if (!bq27220Unseal(addr)) {
+    BQ27220_TRACE_FAIL("unseal");
+    return false;
+  }
+
+  uint16_t opStatus = 0;
+  if (!bq27220ReadReg16Retry(addr, BQ27220_CMD_OPERATION_STATUS, opStatus)) {
+    BQ27220_TRACE_FAIL("read operation status");
+    return false;
+  }
+  bool needsProvisioning =
+      (opStatus & BQ27220_OPSTATUS_INITCOMP) == 0 || (opStatus & BQ27220_OPSTATUS_CFGUPDATE) != 0;
+
+  uint16_t ctrlStatus = 0;
+  if (!bq27220ReadReg16Retry(addr, BQ27220_CMD_CONTROL, ctrlStatus)) {
+    BQ27220_TRACE_FAIL("read control status");
+    return false;
+  }
+  if ((ctrlStatus & BQ27220_CTRLSTATUS_BATT_ID_MASK) != 0) needsProvisioning = true;
+
+  if (!needsProvisioning && !bq27220ApplyOrVerifyDataMemory(addr, /*write=*/false)) {
+    needsProvisioning = true;
+  }
+
+#if defined(ENABLE_SERIAL_LOG)
+  esp_rom_printf("[BATT] BQ27220 opStatus=0x%04X ctrlStatus=0x%04X needsProvisioning=%u\n", opStatus, ctrlStatus,
+                  needsProvisioning ? 1 : 0);
+#endif
+
+  if (needsProvisioning) {
+    // Best-effort, not a gate: the vendor's own reference init() (LilyGo's
+    // lib/BQ27220, BQ27220::init()) calls reset() here and only logs on
+    // failure -- it does NOT bail out, and proceeds to fullAccess() and the
+    // data-memory write regardless. On this board reset()'s OperationStatus
+    // never shows the expected INITCOMP transition within its timeout (opStatus
+    // reads back identical for the full 4s), matching the vendor's own comment
+    // doubting whether even the following fullAccess() call is necessary. What
+    // actually provisions the gauge is fullAccess() + the data-memory write
+    // below, not this step completing.
+    if (!bq27220Reset(addr)) {
+      BQ27220_TRACE_FAIL("reset (continuing anyway, as the vendor's own init() does)");
+    }
+    if (!bq27220RetryStage(bq27220FullAccess, addr)) {
+      BQ27220_TRACE_FAIL("full access");
+      return false;
+    }
+    bq27220ApplyOrVerifyDataMemory(addr, /*write=*/true);
+    if (!bq27220ApplyOrVerifyDataMemory(addr, /*write=*/false)) {
+      BQ27220_TRACE_FAIL("data memory write/verify");
+      return false;
+    }
+  }
+
+  if (!bq27220RetryStage(bq27220Seal, addr)) {
+    BQ27220_TRACE_FAIL("seal");
+    return false;
+  }
+  return true;
+#undef BQ27220_TRACE_FAIL
+}
+
+// Whether this boot's BQ27220 data-memory provisioning has succeeded (see
+// readGaugeSoc() below, which is the only writer). File-scope so
+// BatteryMonitor::isGaugeProvisioned() can read it from outside this
+// function with no I2C traffic -- see that method's doc comment.
+static bool bq27220Initialized = false;
+
 // SoC (0..100) from the active gauge, dispatched by type. false on I2C failure.
 bool readGaugeSoc(uint16_t& out) {
   const auto& g = BoardConfig::ACTIVE.batteryGauge;
@@ -497,10 +949,46 @@ bool readGaugeSoc(uint16_t& out) {
     out = soc;
     return true;
   }
+  // One-time (per boot) data-memory provisioning: see bq27220EnsureProfile's
+  // own comment for why this fixes the reported-percentage-vs-real-voltage
+  // mismatch. Same bounded-retry shape as cw2017EnsureProfile above -- a
+  // transient I2C error on the very first call must not be cached as
+  // permanent failure. File-scope (not function-local) so
+  // bq27220GaugeProvisioned() below can expose it to BatteryMonitor's
+  // isGaugeProvisioned() without any extra I2C traffic.
+  static unsigned long bq27220LastInitAttemptMs = 0;
+  if (!bq27220Initialized) {
+    const unsigned long now = millis();
+    if (bq27220LastInitAttemptMs != 0 && (now - bq27220LastInitAttemptMs) < 1000) return false;
+    bq27220LastInitAttemptMs = now;
+    bq27220Initialized = bq27220EnsureProfile(g.gaugeAddr);
+#if defined(ENABLE_SERIAL_LOG)
+    esp_rom_printf("[BATT] BQ27220 data-memory provisioning: %s\n",
+                    bq27220Initialized ? "ok (matches target profile)" : "failed, retrying");
+#endif
+    if (!bq27220Initialized) return false;
+  }
+
   uint16_t soc = 0;
-  if (!readReg16(g.gaugeAddr, BQ27220_STATE_OF_CHARGE, soc)) return false;
+  if (!readReg16(g.gaugeAddr, BQ27220_STATE_OF_CHARGE, soc)) {
+#if defined(ENABLE_SERIAL_LOG)
+    // Diagnostic only (card: battery stops reporting a charge around 35%). If
+    // this fires repeatedly while the charger-side log above keeps saying
+    // fast-charge, the on-screen percentage is frozen because the gauge
+    // stopped answering, not because the pack is actually done charging.
+    esp_rom_printf("[BATT] BQ27220 SoC read (addr 0x%02X reg 0x%02X) failed\n", g.gaugeAddr,
+                    BQ27220_STATE_OF_CHARGE);
+#endif
+    return false;
+  }
   out = soc > 100 ? 100 : soc;
   return true;
+}
+
+// Read-only, no-I2C accessor for BatteryMonitor::isGaugeProvisioned() --
+// see that method's doc comment for why main.cpp needs this.
+bool bq27220GaugeProvisioned() {
+  return bq27220Initialized;
 }
 
 // Battery voltage (mV) from the active gauge, dispatched by type. false on failure.
@@ -543,6 +1031,79 @@ bool readChargerCharging(bool& known) {
   return chrg == 0x01 || chrg == 0x02;
 }
 
+#if defined(ENABLE_SERIAL_LOG)
+// Diagnostic only (card: battery stops reporting a charge around 35%). Logs the
+// BQ25896's CHRG_STAT with the BQ27220's own VBAT/current, throttled to a change
+// or every 30s, plus a one-time dump of the registers that decide when charging
+// terminates. Separate from readChargerCharging() so that stays upstream's; it
+// re-reads REG0B itself. `known` is readChargerCharging()'s result, so a failed
+// status read is reported here too. No-op on boards without a BQ25896.
+void bq25896LogDiagnostics(const bool known) {
+  const auto& g = BoardConfig::ACTIVE.batteryGauge;
+  if (g.chargerAddr == 0 || g.chargerType != BoardConfig::ChargerType::Bq25896) return;
+  uint8_t status = 0;
+  if (!known || !readReg8(g.chargerAddr, BQ25896_REG_STATUS, status)) {
+    esp_rom_printf("[BATT] BQ25896 status read (addr 0x%02X reg 0x%02X) failed\n", g.chargerAddr,
+                    BQ25896_REG_STATUS);
+    return;
+  }
+  const uint8_t chrg = (status >> 3) & 0x03;
+  // CHRG_STAT: 00 not charging, 01 pre-charge, 10 fast charge, 11 charge
+  // termination done. Distinguishes "the BQ25896 itself ended the charge"
+  // (0b11) from "the gauge stopped answering" (readGaugeSoc() failing, chrg
+  // still 0b10) -- those look identical on-screen but need different fixes.
+  static unsigned long lastLogMs = 0;
+  static uint8_t lastChrg = 0xFF;
+  const unsigned long now = millis();
+  if (chrg != lastChrg || (now - lastLogMs) >= 30000) {
+    const uint8_t vbus = (status >> 5) & 0x07;
+    const bool powerGood = (status & 0x04) != 0;
+    // The BQ27220 measures the battery directly, so a voltage close to REG06's
+    // VREG at a low SoC means the pack genuinely reached it early.
+    uint16_t vmv = 0;
+    uint16_t rawCur = 0;
+    const bool haveV = readReg16(g.gaugeAddr, BQ27220_VOLTAGE, vmv);
+    const bool haveI = readReg16(g.gaugeAddr, BQ27220_CURRENT, rawCur);
+    esp_rom_printf(
+        "[BATT] BQ25896 REG0B=0x%02X VBUS_STAT=%u PG=%u CHRG_STAT=%u (%s) | BQ27220 VBAT=%dmV I=%dmA\n",
+        status, vbus, powerGood ? 1 : 0, chrg,
+        chrg == 0x00   ? "not-charging"
+        : chrg == 0x01 ? "pre-charge"
+        : chrg == 0x02 ? "fast-charge"
+                       : "done/terminated",
+        haveV ? static_cast<int>(vmv) : -1, haveI ? static_cast<int>(static_cast<int16_t>(rawCur)) : -1);
+    lastLogMs = now;
+    lastChrg = chrg;
+  }
+  // Read once: the board runs on the BQ25896's power-up config, which firmware
+  // never writes, so these values do not change at runtime.
+  static bool dumpedConfig = false;
+  if (!dumpedConfig) {
+    dumpedConfig = true;
+    uint8_t reg00 = 0, reg04 = 0, reg05 = 0, reg06 = 0;
+    const bool ok00 = readReg8(g.chargerAddr, 0x00, reg00);
+    const bool ok04 = readReg8(g.chargerAddr, 0x04, reg04);
+    const bool ok05 = readReg8(g.chargerAddr, 0x05, reg05);
+    const bool ok06 = readReg8(g.chargerAddr, 0x06, reg06);
+    if (ok00 && ok04 && ok05 && ok06) {
+      const bool hiz = (reg00 & 0x80) != 0;
+      const unsigned iinlimMa = 100u + (reg00 & 0x3F) * 50u;
+      const unsigned ichgMa = (reg04 & 0x7F) * 64u;
+      const unsigned itermMa = 64u + (reg05 & 0x0F) * 64u;
+      const unsigned iprechgMa = 64u + ((reg05 >> 4) & 0x0F) * 64u;
+      const unsigned vregMv = 3840u + ((reg06 >> 2) & 0x3F) * 16u;
+      esp_rom_printf(
+          "[BATT] BQ25896 config: REG00=0x%02X HIZ=%u IINLIM=%umA | REG04=0x%02X ICHG=%umA | "
+          "REG05=0x%02X IPRECHG=%umA ITERM=%umA | REG06=0x%02X VREG=%umV\n",
+          reg00, hiz ? 1 : 0, iinlimMa, reg04, ichgMa, reg05, iprechgMa, itermMa, reg06, vregMv);
+    } else {
+      esp_rom_printf("[BATT] BQ25896 config register read failed (REG00=%d REG04=%d REG05=%d REG06=%d)\n", ok00,
+                      ok04, ok05, ok06);
+    }
+  }
+}
+#endif
+
 // Charging state for an I2C-gauge board, from the active board's gauge config.
 // Two sources, in order of preference:
 //   1. A dedicated charger IC (BQ25896): CHRG_STAT in REG0B[4:3] — 01 pre-charge
@@ -567,6 +1128,9 @@ bool readGaugeCharging(bool& known) {
     return false;
   }
   const bool charging = readChargerCharging(known);
+#if defined(ENABLE_SERIAL_LOG)
+  bq25896LogDiagnostics(known);
+#endif
   if (known) return charging;
   uint16_t raw = 0;
   if (readReg16(g.gaugeAddr, BQ27220_CURRENT, raw)) {
@@ -1008,6 +1572,21 @@ bool BatteryMonitor::isExternalPowerPresent(bool* known) const {
 
   if (known) *known = false;
   return false;
+}
+
+bool BatteryMonitor::isGaugeProvisioned() const {
+#if FREEINK_BATTERY_I2C_GAUGE
+  const auto& g = BoardConfig::ACTIVE.batteryGauge;
+  // Only the BQ27220 path has a one-time provisioning step to track; CW2017
+  // (cw2017EnsureProfile) and AXP2101 need no equivalent wait, and boards
+  // with no I2C gauge at all have nothing to provision -- all report true
+  // so main.cpp's battery-poll gate does not force extra polling for them.
+  if (g.gaugeAddr != 0 && g.gaugeType != BoardConfig::GaugeType::Cw2017 &&
+      g.gaugeType != BoardConfig::GaugeType::Axp2101) {
+    return bq27220GaugeProvisioned();
+  }
+#endif
+  return true;
 }
 
 bool BatteryMonitor::readM5Pm1Status(Status& status) const {
