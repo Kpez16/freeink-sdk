@@ -34,7 +34,7 @@ The original pin map and controller details came from stock-firmware analysis
 | Panel RAM | 768 × **600**; host FB is 768×552 sent **bottom-up**, then 48 white rows |
 | Framebuffer | 52,992 bytes (768/8 × 552); grayscale planes 52,992 B each, lazy from PSRAM |
 | Display SPI | SCLK 42, MOSI 45, CS 21, DC 14, RST 13, BUSY 41, PWR-EN 6 · **20 MHz** |
-| MicroSD | dedicated **HSPI** bus: SCLK 39, MISO 40, MOSI 38, CS 47 · 20 MHz |
+| MicroSD | dedicated **HSPI** bus: SCLK 39, MISO 40, MOSI 38, CS 47 · 20 MHz; power enable GPIO6 (active-low) on units whose CW2015 gauge answers at I²C 0x62, otherwise GPIO6 is left HIGH as display enable (decided at runtime in `SDCardManager`) |
 | Buttons | UP 5 and DOWN 7 active-low; POWER 8 active-high with INPUT_PULLDOWN |
 | Battery | ADC GPIO 10, charge-status GPIO 11, divider ×1.559 |
 | Touch | **GSLX680** — SDA 2, SCL 1, RST 3, addr 0x40. Firmware blob uploaded at boot (`gsl/EegoA4GslFirmware.h`, extracted + hash-verified); backend in InputManager. |
