@@ -254,7 +254,21 @@ bool hostI2cRead(const uint8_t addr, const uint8_t reg, uint8_t* out, const size
   return true;
 }
 
+// The LilyGo T5 S3's data-memory profile is for its own cell: reading SoC on
+// another BQ27220 board must not write the gauge.
+void testSocReadOnlyProvisionsTheT5() {
+  FakeGauge fake;
+  gauge = &fake;
+  BoardConfig::ACTIVE = BoardConfig::XTEINK_X3;
+  uint16_t soc = 0;
+  readGaugeSoc(soc);
+  readGaugeSoc(soc);
+  CHECK(fake.writes() == 0);
+  CHECK(fake.get(DM_DC) == 3000);
+}
+
 int main() {
+  testSocReadOnlyProvisionsTheT5();
   testDefaultIsLoadedAndSealed();
   testOtherCapacitiesAndBoardsAreLeftAlone();
   testCapacityLearnedAgainstTheDefaultIsReplaced();

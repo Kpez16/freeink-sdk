@@ -64,7 +64,12 @@ reference port at **`lib/Board_T5S3/FreeInkLgfxConfig.cpp`**.
   (`FREEINK_BATTERY_I2C_GAUGE`) reads SoC/voltage from the BQ27220 and charge
   status from the BQ25896, with addresses/pins from `BoardProfile.batteryGauge`. It
   presents the same API as the ADC path and uses a minimal raw-register read (no
-  external library).
+  external library). On this board only, the first SoC read of a boot checks the
+  BQ27220's data memory against LilyGo's 1500 mAh CEDV profile and, if it differs,
+  unseals the gauge, writes the profile to its non-volatile memory and seals it
+  again (at most 3 attempts per boot; each can block the caller for several
+  seconds). Learned Full Charge Capacity is written but not compared, because the
+  gauge adjusts it as the cell ages.
 - **Power button and sleep** — the power button is the BOOT button (GPIO0, a
   direct RTC-capable GPIO); the profile sets `input.power = GPIO0`. `InputManager`
   reads it, and `PowerManager::armPowerButtonWakeup()` arms deep-sleep wake on it
